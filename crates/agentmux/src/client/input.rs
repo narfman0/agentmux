@@ -10,8 +10,10 @@ pub enum InputMode {
     AgentPicker { selected: usize, count: usize },
     /// Inline rename prompt for the focused pane.
     Rename { buf: String },
-    /// Custom-params form for spawning a pane with arbitrary command/args/cwd.
-    StartParams { cmd: String, args: String, cwd: String, focused: usize },
+    /// Inline rename prompt for the session title.
+    RenameTitle { buf: String },
+    /// Custom-params form for spawning a pane with arbitrary command/args/cwd/title.
+    StartParams { cmd: String, args: String, cwd: String, title: String, focused: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -36,17 +38,22 @@ pub enum Action {
     BackToDashboard,   // Escape → Dashboard mode
     PaneInput(Vec<u8>), // pass-through to PTY
 
-    // Rename
+    // Rename pane
     StartRename,
     ConfirmRename(String),
     CancelRename,
+
+    // Rename session title
+    StartRenameTitle,
+    ConfirmRenameTitle(String),
+    CancelRenameTitle,
 
     // Direct pane jump (0-indexed)
     SelectPane(usize),
 
     // Start-params form
     OpenStartParams,
-    StartParamsConfirm { cmd: String, args: String, cwd: String },
+    StartParamsConfirm { cmd: String, args: String, cwd: String, title: String },
     StartParamsCancel,
 
     Quit,
@@ -80,26 +87,35 @@ pub fn handle_key(mode: &mut InputMode, ev: KeyEvent) -> Option<Action> {
             }
         }
 
-        InputMode::Dashboard => match ev.code {
-            KeyCode::Up    => Some(Action::DashboardUp),
-            KeyCode::Down  => Some(Action::DashboardDown),
-            KeyCode::Left  => Some(Action::DashboardLeft),
-            KeyCode::Right => Some(Action::DashboardRight),
-            KeyCode::Enter                       => Some(Action::DashboardSelect),
-            KeyCode::Char('n')                   => Some(Action::AddPane),
-            KeyCode::Char('N')                   => Some(Action::OpenStartParams),
-            KeyCode::Char('x')                   => Some(Action::RemovePane),
-            KeyCode::Char('b')                   => Some(Action::ToggleBroadcast),
-            KeyCode::Char('r')                   => Some(Action::StartRename),
-            KeyCode::Char('q') | KeyCode::Esc   => Some(Action::Quit),
-            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                Some(Action::SelectPane((c as usize) - ('1' as usize)))
+        InputMode::Dashboard => {
+            if ev.code == KeyCode::Char('r') && ev.modifiers == KeyModifiers::CONTROL {
+                return Some(Action::StartRenameTitle);
             }
-            _ => None,
-        },
+            match ev.code {
+                KeyCode::Up    => Some(Action::DashboardUp),
+                KeyCode::Down  => Some(Action::DashboardDown),
+                KeyCode::Left  => Some(Action::DashboardLeft),
+                KeyCode::Right => Some(Action::DashboardRight),
+                KeyCode::Enter                       => Some(Action::DashboardSelect),
+                KeyCode::Char('n')                   => Some(Action::AddPane),
+                KeyCode::Char('N')                   => Some(Action::OpenStartParams),
+                KeyCode::Char('x')                   => Some(Action::RemovePane),
+                KeyCode::Char('b')                   => Some(Action::ToggleBroadcast),
+                KeyCode::Char('r')                   => Some(Action::StartRename),
+                KeyCode::Char('q') | KeyCode::Esc   => Some(Action::Quit),
+                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                    Some(Action::SelectPane((c as usize) - ('1' as usize)))
+                }
+                _ => None,
+            }
+        }
 
         InputMode::Detail => {
             if ev.code == KeyCode::Esc {
+                *mode = InputMode::Dashboard;
+                return Some(Action::BackToDashboard);
+            }
+            if ev.code == KeyCode::Char('\\') && ev.modifiers == KeyModifiers::CONTROL {
                 *mode = InputMode::Dashboard;
                 return Some(Action::BackToDashboard);
             }
@@ -133,17 +149,38 @@ pub fn handle_key(mode: &mut InputMode, ev: KeyEvent) -> Option<Action> {
             _ => None,
         },
 
-        InputMode::StartParams { cmd, args, cwd, focused } => match ev.code {
+        InputMode::RenameTitle { buf } => match ev.code {
+            KeyCode::Enter => {
+                let name = buf.clone();
+                *mode = InputMode::Dashboard;
+                Some(Action::ConfirmRenameTitle(name))
+            }
+            KeyCode::Esc => {
+                *mode = InputMode::Dashboard;
+                Some(Action::CancelRenameTitle)
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                None
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                None
+            }
+            _ => None,
+        },
+
+        InputMode::StartParams { cmd, args, cwd, title, focused } => match ev.code {
             KeyCode::Tab => {
-                *focused = (*focused + 1) % 3;
+                *focused = (*focused + 1) % 4;
                 None
             }
             KeyCode::BackTab => {
-                *focused = (*focused + 2) % 3;
+                *focused = (*focused + 3) % 4;
                 None
             }
             KeyCode::Down => {
-                if *focused < 2 { *focused += 1; }
+                if *focused < 3 { *focused += 1; }
                 None
             }
             KeyCode::Up => {
@@ -154,8 +191,9 @@ pub fn handle_key(mode: &mut InputMode, ev: KeyEvent) -> Option<Action> {
                 let c = cmd.clone();
                 let a = args.clone();
                 let d = cwd.clone();
+                let t = title.clone();
                 *mode = InputMode::Dashboard;
-                Some(Action::StartParamsConfirm { cmd: c, args: a, cwd: d })
+                Some(Action::StartParamsConfirm { cmd: c, args: a, cwd: d, title: t })
             }
             KeyCode::Esc => {
                 *mode = InputMode::Dashboard;
@@ -165,7 +203,8 @@ pub fn handle_key(mode: &mut InputMode, ev: KeyEvent) -> Option<Action> {
                 match *focused {
                     0 => { cmd.pop(); }
                     1 => { args.pop(); }
-                    _ => { cwd.pop(); }
+                    2 => { cwd.pop(); }
+                    _ => { title.pop(); }
                 }
                 None
             }
@@ -173,7 +212,8 @@ pub fn handle_key(mode: &mut InputMode, ev: KeyEvent) -> Option<Action> {
                 match *focused {
                     0 => cmd.push(c),
                     1 => args.push(c),
-                    _ => cwd.push(c),
+                    2 => cwd.push(c),
+                    _ => title.push(c),
                 }
                 None
             }
@@ -186,14 +226,22 @@ pub fn handle_key(mode: &mut InputMode, ev: KeyEvent) -> Option<Action> {
 pub fn keyevent_to_bytes(ev: KeyEvent) -> Vec<u8> {
     match ev.code {
         KeyCode::Char(c) => {
-            if ev.modifiers == KeyModifiers::CONTROL {
-                let byte = (c as u8).to_ascii_uppercase();
-                if (b'A'..=b'Z').contains(&byte) {
-                    return vec![byte - b'A' + 1];
-                }
+            let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+            let alt  = ev.modifiers.contains(KeyModifiers::ALT);
+            let upper = (c as u8).to_ascii_uppercase();
+            let base: Vec<u8> = if ctrl && (b'A'..=b'Z').contains(&upper) {
+                vec![upper - b'A' + 1]
+            } else {
+                let mut buf = [0u8; 4];
+                c.encode_utf8(&mut buf).as_bytes().to_vec()
+            };
+            if alt {
+                let mut out = vec![0x1b];
+                out.extend(base);
+                out
+            } else {
+                base
             }
-            let mut buf = [0u8; 4];
-            c.encode_utf8(&mut buf).as_bytes().to_vec()
         }
         KeyCode::Enter     => vec![b'\r'],
         KeyCode::Tab       => vec![b'\t'],
@@ -208,6 +256,7 @@ pub fn keyevent_to_bytes(ev: KeyEvent) -> Vec<u8> {
         KeyCode::End       => vec![0x1b, b'[', b'F'],
         KeyCode::PageUp    => vec![0x1b, b'[', b'5', b'~'],
         KeyCode::PageDown  => vec![0x1b, b'[', b'6', b'~'],
+        KeyCode::BackTab   => vec![0x1b, b'[', b'Z'],
         KeyCode::F(n)      => f_key_bytes(n),
         _                  => vec![],
     }

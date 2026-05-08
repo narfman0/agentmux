@@ -55,16 +55,16 @@ fn main() -> anyhow::Result<()> {
         None => {
             let session = "default".to_string();
             ensure_server_running(&session, &cli.agent)?;
-            rt.block_on(client::app::run(&cli.agent, cli.cwd))?;
+            rt.block_on(client::app::run(&cli.agent, &session, cli.cwd))?;
         }
 
         Some(Commands::New { name }) => {
             ensure_server_running(&name, &cli.agent)?;
-            rt.block_on(client::app::run(&cli.agent, cli.cwd))?;
+            rt.block_on(client::app::run(&cli.agent, &name, cli.cwd))?;
         }
 
-        Some(Commands::Attach { name: _ }) => {
-            rt.block_on(client::app::run(&cli.agent, cli.cwd))?;
+        Some(Commands::Attach { name }) => {
+            rt.block_on(client::app::run(&cli.agent, &name, cli.cwd))?;
         }
 
         Some(Commands::List) => {

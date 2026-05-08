@@ -34,6 +34,7 @@ pub struct AppState {
     pub selected: usize,
     pub broadcast: bool,
     pub default_cwd: Option<String>,
+    pub title: String,
 }
 
 impl AppState {
@@ -44,6 +45,7 @@ impl AppState {
             selected: 0,
             broadcast: false,
             default_cwd: cwd,
+            title: String::new(),
         })
     }
 
@@ -86,7 +88,7 @@ impl AppState {
     }
 }
 
-pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
+pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> Result<()> {
     let cfg = loader::load();
     loader::ensure_example_config();
 
@@ -118,6 +120,7 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
     let initial_args: Vec<String> = agent_args.first().cloned().unwrap_or_default();
     let initial_args_refs: Vec<&str> = initial_args.iter().map(|s| s.as_str()).collect();
     let mut state = AppState::new(initial_cmd, &initial_args_refs, pane_cols, pane_rows, cwd)?;
+    state.title = session_name.to_string();
     let mut current_size = term_size;
 
     enable_raw_mode()?;
@@ -160,6 +163,15 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
 
                         match &mode {
                             InputMode::Dashboard | InputMode::AgentPicker { .. } | InputMode::StartParams { .. } => {
+                                let dash_chunks = RLayout::default()
+                                    .direction(Direction::Vertical)
+                                    .constraints([Constraint::Length(1), Constraint::Min(1)])
+                                    .split(content_area);
+                                let title_area = dash_chunks[0];
+                                let grid_area = dash_chunks[1];
+
+                                render_session_title(title_area, f.buffer_mut(), &state.title);
+
                                 let labels: Vec<String> = state.panes.iter()
                                     .enumerate()
                                     .map(|(i, p)| format!("[{}] {}", i + 1, p.label()))
@@ -175,19 +187,19 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
                                     })
                                     .collect();
 
-                                Dashboard { items, cols: grid_cols }.render(content_area, f.buffer_mut());
+                                Dashboard { items, cols: grid_cols }.render(grid_area, f.buffer_mut());
 
                                 if let InputMode::AgentPicker { selected: picker_sel, .. } = &mode {
                                     AgentPicker {
                                         agents: &agent_names,
                                         selected: *picker_sel,
                                     }
-                                    .render_popup(content_area, f.buffer_mut());
+                                    .render_popup(grid_area, f.buffer_mut());
                                 }
 
-                                if let InputMode::StartParams { cmd, args, cwd, focused } = &mode {
-                                    StartParamsModal { cmd, args, cwd, focused: *focused }
-                                        .render_popup(content_area, f.buffer_mut());
+                                if let InputMode::StartParams { cmd, args, cwd, title, focused } = &mode {
+                                    StartParamsModal { cmd, args, cwd, title, focused: *focused }
+                                        .render_popup(grid_area, f.buffer_mut());
                                 }
 
                                 render_dashboard_status(status_area, f.buffer_mut(), broadcast);
@@ -218,7 +230,22 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
                                 );
                             }
 
-                            InputMode::Rename { buf } => {
+                            InputMode::Rename { buf } | InputMode::RenameTitle { buf } => {
+                                let is_title_rename = matches!(&mode, InputMode::RenameTitle { .. });
+                                let dash_chunks = RLayout::default()
+                                    .direction(Direction::Vertical)
+                                    .constraints([Constraint::Length(1), Constraint::Min(1)])
+                                    .split(content_area);
+                                let title_area = dash_chunks[0];
+                                let grid_area = dash_chunks[1];
+
+                                let display_title = if is_title_rename {
+                                    format!("{}_", buf)
+                                } else {
+                                    state.title.clone()
+                                };
+                                render_session_title(title_area, f.buffer_mut(), &display_title);
+
                                 let labels: Vec<String> = state.panes.iter()
                                     .enumerate()
                                     .map(|(i, p)| format!("[{}] {}", i + 1, p.label()))
@@ -232,8 +259,12 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
                                         broadcast,
                                     })
                                     .collect();
-                                Dashboard { items, cols: grid_cols }.render(content_area, f.buffer_mut());
-                                render_rename_status(status_area, f.buffer_mut(), buf);
+                                Dashboard { items, cols: grid_cols }.render(grid_area, f.buffer_mut());
+                                if is_title_rename {
+                                    render_rename_title_status(status_area, f.buffer_mut());
+                                } else {
+                                    render_rename_status(status_area, f.buffer_mut(), buf);
+                                }
                             }
                         }
                     })?;
@@ -321,16 +352,29 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
 
                                         Action::CancelRename => {}
 
+                                        Action::StartRenameTitle => {
+                                            mode = InputMode::RenameTitle { buf: state.title.clone() };
+                                        }
+
+                                        Action::ConfirmRenameTitle(name) => {
+                                            if !name.is_empty() {
+                                                state.title = name;
+                                            }
+                                        }
+
+                                        Action::CancelRenameTitle => {}
+
                                         Action::OpenStartParams => {
                                             mode = InputMode::StartParams {
                                                 cmd: String::new(),
                                                 args: String::new(),
                                                 cwd: String::new(),
+                                                title: String::new(),
                                                 focused: 0,
                                             };
                                         }
 
-                                        Action::StartParamsConfirm { cmd, args: args_str, cwd } => {
+                                        Action::StartParamsConfirm { cmd, args: args_str, cwd, title } => {
                                             let parsed: Vec<String> = args_str.split_whitespace().map(String::from).collect();
                                             let args_refs: Vec<&str> = parsed.iter().map(|s| s.as_str()).collect();
                                             let effective_cwd = if cwd.is_empty() { None } else { Some(cwd.as_str()) };
@@ -338,6 +382,9 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
                                             let (tc, tr) = thumbnail_size(current_size, state.panes.len() + 1, gc);
                                             if !cmd.is_empty() {
                                                 state.add_pane(&cmd, &args_refs, effective_cwd, tc, tr)?;
+                                                if !title.is_empty() {
+                                                    state.title = title;
+                                                }
                                                 let (cols, rows) = current_size;
                                                 let pc = cols.saturating_sub(2).max(1);
                                                 let pr = rows.saturating_sub(3).max(1);
@@ -423,7 +470,8 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
 fn thumbnail_size(term: (u16, u16), n: usize, grid_cols: usize) -> (u16, u16) {
     let rows_count = n.div_ceil(grid_cols) as u16;
     let cell_w = (term.0 / grid_cols as u16).saturating_sub(2).max(1);
-    let cell_h = ((term.1.saturating_sub(1)) / rows_count).saturating_sub(2).max(1);
+    // subtract 2: 1 for status bar + 1 for session title bar
+    let cell_h = ((term.1.saturating_sub(2)) / rows_count).saturating_sub(2).max(1);
     (cell_w, cell_h)
 }
 
@@ -433,6 +481,13 @@ fn resize_all_for_dashboard(state: &mut AppState, term: (u16, u16), grid_cols: u
     for p in &mut state.panes {
         p.resize(tc, tr);
     }
+}
+
+fn render_session_title(area: Rect, buf: &mut ratatui::buffer::Buffer, title: &str) {
+    let amber = Color::Rgb(255, 176, 0);
+    let centered = format!("{:^width$}", title, width = area.width as usize);
+    Line::from(Span::styled(centered, Style::default().fg(amber).add_modifier(Modifier::BOLD)))
+        .render(area, buf);
 }
 
 fn render_dashboard_status(area: Rect, buf: &mut ratatui::buffer::Buffer, broadcast: bool) {
@@ -453,6 +508,21 @@ fn render_dashboard_status(area: Rect, buf: &mut ratatui::buffer::Buffer, broadc
     } else {
         spans.push(Span::styled("  b: broadcast  q: quit", bg));
     }
+    Line::from(spans).render(area, buf);
+}
+
+fn render_rename_title_status(area: Rect, buf: &mut ratatui::buffer::Buffer) {
+    let bg = Style::default().bg(Color::DarkGray).fg(Color::White);
+    for x in area.x..area.x + area.width {
+        if let Some(c) = buf.cell_mut((x, area.y)) {
+            c.set_char(' ');
+            c.set_style(bg);
+        }
+    }
+    let spans = vec![
+        Span::styled(" RENAME TITLE ", Style::default().bg(Color::Rgb(255, 176, 0)).fg(Color::Black).add_modifier(Modifier::BOLD)),
+        Span::styled("  Type new title  Enter: confirm  Esc: cancel", Style::default().bg(Color::DarkGray).fg(Color::Gray)),
+    ];
     Line::from(spans).render(area, buf);
 }
 
@@ -483,7 +553,7 @@ fn render_detail_status(area: Rect, buf: &mut ratatui::buffer::Buffer, agent: &s
     }
     let mut spans = vec![
         Span::styled(format!(" {} ", agent), Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)),
-        Span::styled("  Esc: back to dashboard", bg),
+        Span::styled("  Esc/Ctrl+\\: back to dashboard", bg),
     ];
     if broadcast {
         spans.push(Span::styled("  [BROADCAST] ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)));
