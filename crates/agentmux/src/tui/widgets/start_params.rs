@@ -6,14 +6,15 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Widget},
 };
 
-const LABELS: [&str; 3] = ["Command", "Args   ", "Cwd    "];
+const LABELS: [&str; 4] = ["Command", "Args   ", "Cwd    ", "Title  "];
 const POPUP_W: u16 = 64;
-const POPUP_H: u16 = 13;
+const POPUP_H: u16 = 16;
 
 pub struct StartParamsModal<'a> {
     pub cmd: &'a str,
     pub args: &'a str,
     pub cwd: &'a str,
+    pub title: &'a str,
     pub focused: usize,
 }
 
@@ -38,7 +39,7 @@ impl<'a> StartParamsModal<'a> {
             height: popup.height.saturating_sub(2),
         };
 
-        let values = [self.cmd, self.args, self.cwd];
+        let values = [self.cmd, self.args, self.cwd, self.title];
         for (i, (label, value)) in LABELS.iter().zip(values.iter()).enumerate() {
             let row_y = inner.y + (i as u16) * 3;
             if row_y >= inner.y + inner.height {
