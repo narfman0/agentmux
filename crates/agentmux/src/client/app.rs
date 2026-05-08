@@ -3,10 +3,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyEventKind},
+    event::{self, Event, EventStream, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use futures::StreamExt as _;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout as RLayout, Rect},
@@ -31,15 +32,17 @@ pub struct AppState {
     pub panes: Vec<PaneState>,
     pub selected: usize,
     pub broadcast: bool,
+    pub default_cwd: Option<String>,
 }
 
 impl AppState {
-    pub fn new(initial_cmd: &str, cols: u16, rows: u16) -> Result<Self> {
-        let pane = PaneState::new(initial_cmd, cols, rows)?;
+    pub fn new(initial_cmd: &str, initial_args: &[&str], cols: u16, rows: u16, cwd: Option<String>) -> Result<Self> {
+        let pane = PaneState::new(initial_cmd, initial_args, cols, rows, cwd.as_deref())?;
         Ok(Self {
             panes: vec![pane],
             selected: 0,
             broadcast: false,
+            default_cwd: cwd,
         })
     }
 
@@ -47,8 +50,9 @@ impl AppState {
         self.panes.get_mut(self.selected)
     }
 
-    fn add_pane(&mut self, cmd: &str, cols: u16, rows: u16) -> Result<()> {
-        let pane = PaneState::new(cmd, cols, rows)?;
+    fn add_pane(&mut self, cmd: &str, args: &[&str], agent_cwd: Option<&str>, cols: u16, rows: u16) -> Result<()> {
+        let effective_cwd = agent_cwd.or(self.default_cwd.as_deref());
+        let pane = PaneState::new(cmd, args, cols, rows, effective_cwd)?;
         self.panes.push(pane);
         self.selected = self.panes.len() - 1;
         Ok(())
@@ -81,7 +85,7 @@ impl AppState {
     }
 }
 
-pub async fn run(initial_cmd: &str) -> Result<()> {
+pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
     let cfg = loader::load();
     loader::ensure_example_config();
 
@@ -95,12 +99,24 @@ pub async fn run(initial_cmd: &str) -> Result<()> {
     } else {
         cfg.agent.iter().map(|a| a.command.clone()).collect()
     };
+    let agent_args: Vec<Vec<String>> = if cfg.agent.is_empty() {
+        vec![vec![]]
+    } else {
+        cfg.agent.iter().map(|a| a.args.clone()).collect()
+    };
+    let agent_cwds: Vec<Option<String>> = if cfg.agent.is_empty() {
+        vec![None]
+    } else {
+        cfg.agent.iter().map(|a| a.cwd.clone()).collect()
+    };
 
     let term_size = crossterm::terminal::size().unwrap_or((220, 50));
     let pane_cols = term_size.0.saturating_sub(2).max(1);
     let pane_rows = term_size.1.saturating_sub(3).max(1); // reserve status + border
 
-    let mut state = AppState::new(initial_cmd, pane_cols, pane_rows)?;
+    let initial_args: Vec<String> = agent_args.first().cloned().unwrap_or_default();
+    let initial_args_refs: Vec<&str> = initial_args.iter().map(|s| s.as_str()).collect();
+    let mut state = AppState::new(initial_cmd, &initial_args_refs, pane_cols, pane_rows, cwd)?;
     let mut current_size = term_size;
 
     enable_raw_mode()?;
@@ -112,6 +128,7 @@ pub async fn run(initial_cmd: &str) -> Result<()> {
 
     let mut mode = InputMode::Dashboard;
     let mut tick = tokio::time::interval(Duration::from_millis(33));
+    let mut event_reader = EventStream::new();
 
     let result: Result<()> = async {
         loop {
@@ -196,13 +213,43 @@ pub async fn run(initial_cmd: &str) -> Result<()> {
                                     broadcast,
                                 );
                             }
+
+                            InputMode::Rename { buf } => {
+                                let snapshots: Vec<_> = state.panes.iter()
+                                    .map(|p| p.snapshot.lock().unwrap().clone())
+                                    .collect();
+                                let labels: Vec<String> = state.panes.iter()
+                                    .enumerate()
+                                    .map(|(i, p)| format!("[{}] {}", i + 1, p.label()))
+                                    .collect();
+                                let items: Vec<DashboardItem> = snapshots.iter()
+                                    .enumerate()
+                                    .map(|(i, snap)| DashboardItem {
+                                        snapshot: snap,
+                                        title: &labels[i],
+                                        selected: i == sel,
+                                        broadcast,
+                                    })
+                                    .collect();
+                                Dashboard { items, cols: grid_cols }.render(content_area, f.buffer_mut());
+                                render_rename_status(status_area, f.buffer_mut(), buf);
+                            }
                         }
                     })?;
                 }
 
-                _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                    if event::poll(Duration::from_millis(0))? {
-                        match event::read()? {
+                maybe_event = event_reader.next() => {
+                    let first = match maybe_event {
+                        Some(Ok(ev)) => Some(ev),
+                        Some(Err(_)) | None => break,
+                    };
+                    let mut events = Vec::with_capacity(8);
+                    events.extend(first);
+                    while event::poll(Duration::from_millis(0))? {
+                        events.push(event::read()?);
+                    }
+                    for ev in events {
+                        match ev {
                             Event::Key(key) if key.kind == KeyEventKind::Press => {
                                 let grid_cols = Dashboard::grid_cols(state.panes.len());
                                 if let Some(action) = handle_key(&mut mode, key) {
@@ -240,12 +287,44 @@ pub async fn run(initial_cmd: &str) -> Result<()> {
 
                                         Action::PickerConfirm(idx) => {
                                             let cmd = agent_commands.get(idx).map(|s| s.as_str()).unwrap_or(initial_cmd);
+                                            let empty: Vec<String> = vec![];
+                                            let args_strs = agent_args.get(idx).unwrap_or(&empty);
+                                            let args_refs: Vec<&str> = args_strs.iter().map(|s| s.as_str()).collect();
+                                            let agent_cwd = agent_cwds.get(idx).and_then(|c| c.as_deref());
                                             let gc = Dashboard::grid_cols(state.panes.len() + 1);
                                             let (tc, tr) = thumbnail_size(current_size, state.panes.len() + 1, gc);
-                                            state.add_pane(cmd, tc, tr)?;
+                                            state.add_pane(cmd, &args_refs, agent_cwd, tc, tr)?;
                                         }
 
                                         Action::PickerCancel | Action::PickerUp | Action::PickerDown => {}
+
+                                        Action::StartRename => {
+                                            let current = state.panes.get(state.selected)
+                                                .map(|p: &PaneState| p.label())
+                                                .unwrap_or_default();
+                                            mode = InputMode::Rename { buf: current };
+                                        }
+
+                                        Action::ConfirmRename(name) => {
+                                            if let Some(p) = state.panes.get_mut(state.selected) {
+                                                p.name = if name.is_empty() { None } else { Some(name) };
+                                            }
+                                        }
+
+                                        Action::CancelRename => {}
+
+                                        Action::SelectPane(idx) => {
+                                            if idx < state.panes.len() {
+                                                state.selected = idx;
+                                                mode = InputMode::Detail;
+                                                let (cols, rows) = current_size;
+                                                let pc = cols.saturating_sub(2).max(1);
+                                                let pr = rows.saturating_sub(3).max(1);
+                                                if let Some(p) = state.selected_pane_mut() {
+                                                    p.resize(pc, pr);
+                                                }
+                                            }
+                                        }
 
                                         Action::RemovePane => {
                                             state.remove_selected();
@@ -296,6 +375,7 @@ pub async fn run(initial_cmd: &str) -> Result<()> {
     }
     .await;
 
+
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -329,13 +409,30 @@ fn render_dashboard_status(area: Rect, buf: &mut ratatui::buffer::Buffer, broadc
 
     let mut spans = vec![
         Span::styled(" DASHBOARD ", Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled("  ↑↓←→/hjkl: navigate  Enter: open  n: new  x: close", bg),
+        Span::styled("  ↑↓←→/hjkl: navigate  1-9: open  Enter: open  n: new  x: close  r: rename", bg),
     ];
     if broadcast {
         spans.push(Span::styled("  [BROADCAST] ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)));
     } else {
         spans.push(Span::styled("  b: broadcast  q: quit", bg));
     }
+    Line::from(spans).render(area, buf);
+}
+
+fn render_rename_status(area: Rect, buf: &mut ratatui::buffer::Buffer, input: &str) {
+    let bg = Style::default().bg(Color::DarkGray).fg(Color::White);
+    for x in area.x..area.x + area.width {
+        if let Some(c) = buf.cell_mut((x, area.y)) {
+            c.set_char(' ');
+            c.set_style(bg);
+        }
+    }
+    let spans = vec![
+        Span::styled(" RENAME ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)),
+        Span::styled("  New name: ", bg),
+        Span::styled(format!("{}_", input), Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled("  Enter: confirm  Esc: cancel", Style::default().bg(Color::DarkGray).fg(Color::Gray)),
+    ];
     Line::from(spans).render(area, buf);
 }
 

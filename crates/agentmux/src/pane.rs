@@ -2,27 +2,24 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use agentmux_core::protocol::ScreenSnapshot;
-use agentmux_core::session::PaneId;
-use uuid::Uuid;
 
 use crate::pty::{reader::spawn_reader, spawn::spawn_agent};
 use crate::vt::screen::Screen;
 
 pub struct PaneState {
-    pub id: PaneId,
     pub agent_cmd: String,
+    pub name: Option<String>,
     pub snapshot: Arc<Mutex<ScreenSnapshot>>,
-    /// Shared with the reader task for resize.
     screen: Arc<Mutex<Screen>>,
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     pub writer: Box<dyn Write + Send>,
-    pub child: Box<dyn portable_pty::Child + Send>,
+    // Held for its Drop impl — keeps the child process alive while the pane exists.
+    _child: Box<dyn portable_pty::Child + Send>,
 }
 
 impl PaneState {
-    pub fn new(agent_cmd: &str, cols: u16, rows: u16) -> anyhow::Result<Self> {
-        let id: PaneId = Uuid::new_v4();
-        let handle = spawn_agent(agent_cmd, &[], cols, rows)?;
+    pub fn new(agent_cmd: &str, args: &[&str], cols: u16, rows: u16, cwd: Option<&str>) -> anyhow::Result<Self> {
+        let handle = spawn_agent(agent_cmd, args, cols, rows, cwd)?;
 
         let writer = handle
             .master
@@ -47,13 +44,13 @@ impl PaneState {
         }
 
         Ok(Self {
-            id,
             agent_cmd: agent_cmd.to_string(),
+            name: None,
             snapshot,
             screen,
             master: handle.master,
             writer,
-            child: handle.child,
+            _child: handle.child,
         })
     }
 
@@ -65,16 +62,11 @@ impl PaneState {
     }
 
     pub fn write_input(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        self.writer
-            .write_all(data)
-            .map_err(|e| anyhow::anyhow!("pty write: {e}"))
-    }
-
-    pub fn is_alive(&mut self) -> bool {
-        self.child.try_wait().ok().flatten().is_none()
+        self.writer.write_all(data).map_err(|e| anyhow::anyhow!("pty write: {e}"))?;
+        self.writer.flush().map_err(|e| anyhow::anyhow!("pty flush: {e}"))
     }
 
     pub fn label(&self) -> String {
-        self.agent_cmd.clone()
+        self.name.as_deref().unwrap_or(&self.agent_cmd).to_string()
     }
 }
