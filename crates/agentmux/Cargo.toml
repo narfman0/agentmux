@@ -1,0 +1,46 @@
+[package]
+name = "agentmux"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+agentmux-core = { path = "../agentmux-core" }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# PTY (ConPTY on Windows)
+portable-pty = "0.8"
+
+# TUI
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# VT100 parser + screen buffer
+vt100 = "0.15"
+
+# IPC framing
+tokio-util = { version = "0.7", features = ["codec"] }
+bincode = { version = "2", features = ["serde"] }
+bytes = "1"
+
+# Shared state
+parking_lot = "0.12"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Config / serde
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+directories = "5"
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
