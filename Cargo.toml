@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/agentmux-core", "crates/agentmux"]
+members = ["crates/agentmux-core", "crates/agentmux", "crates/agentmuxd"]
 resolver = "2"

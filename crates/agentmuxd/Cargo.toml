@@ -1,24 +1,32 @@
 [package]
-name = "agentmux"
+name = "agentmuxd"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 agentmux-core = { path = "../agentmux-core" }
 
-# CLI
-clap = { version = "4", features = ["derive"] }
-
 # Async
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
 futures = "0.3"
 
-# TUI
-ratatui = "0.28"
-crossterm = { version = "0.28", features = ["event-stream"] }
+# PTY
+portable-pty = "0.8"
+
+# VT100 parser
+vt100 = "0.15"
+
+# IPC framing
+bincode = { version = "2", features = ["serde"] }
+
+# Shared state
+parking_lot = "0.12"
 
 # Error handling
 anyhow = "1"
+thiserror = "1"
 
 # Logging
 tracing = "0.1"
@@ -28,6 +36,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 directories = "5"
+uuid = { version = "1", features = ["v4"] }
+
+# System tray
+tray-icon = "0.19"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Foundation"] }
+windows-sys = { version = "0.52", features = [
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -1,4 +1,3 @@
-/// Server-side session state: holds all panes, their PTY masters/writers, and shared state.
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
@@ -15,7 +14,6 @@ pub struct ServerPane {
     pub meta: Pane,
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     pub writer: Box<dyn Write + Send>,
-    // Held for its Drop impl — keeps the child process alive while the pane exists.
     _child: Box<dyn portable_pty::Child + Send>,
     pub shared: Arc<PaneShared>,
 }
@@ -26,15 +24,20 @@ pub struct ServerSession {
 }
 
 impl ServerSession {
-    pub fn new(name: &str, agent_cmd: &str, agent_args: &[&str], cols: u16, rows: u16) -> anyhow::Result<Self> {
+    pub fn new(
+        name: &str,
+        agent_cmd: &str,
+        agent_args: &[&str],
+        cols: u16,
+        rows: u16,
+        cwd: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let session_id: SessionId = Uuid::new_v4();
         let window_id: WindowId = Uuid::new_v4();
         let pane_id: PaneId = Uuid::new_v4();
 
-        let handle = spawn_agent(agent_cmd, agent_args, cols, rows, None)?;
-        let writer = handle
-            .master
-            .take_writer()
+        let handle = spawn_agent(agent_cmd, agent_args, cols, rows, cwd)?;
+        let writer = handle.master.take_writer()
             .map_err(|e| anyhow::anyhow!("PTY writer: {e}"))?;
 
         let shared = Arc::new(PaneShared::new(cols, rows));
@@ -78,11 +81,9 @@ impl ServerSession {
 
         let mut panes = HashMap::new();
         panes.insert(pane_id, server_pane);
-
         Ok(Self { meta: session, panes })
     }
 
-    /// Split an existing pane, spawning a new agent process.
     pub fn split_pane(
         &mut self,
         target_id: PaneId,
@@ -91,12 +92,11 @@ impl ServerSession {
         agent_args: &[&str],
         cols: u16,
         rows: u16,
+        cwd: Option<&str>,
     ) -> anyhow::Result<PaneId> {
         let new_id: PaneId = Uuid::new_v4();
-        let handle = spawn_agent(agent_cmd, agent_args, cols, rows, None)?;
-        let writer = handle
-            .master
-            .take_writer()
+        let handle = spawn_agent(agent_cmd, agent_args, cols, rows, cwd)?;
+        let writer = handle.master.take_writer()
             .map_err(|e| anyhow::anyhow!("PTY writer: {e}"))?;
         let shared = Arc::new(PaneShared::new(cols, rows));
         pane_task::spawn(new_id, handle.master.as_ref(), shared.clone(), cols, rows)?;
@@ -115,7 +115,6 @@ impl ServerSession {
             ServerPane { meta: pane_meta.clone(), master: handle.master, writer, _child: handle.child, shared },
         );
 
-        // Update the layout in the active window
         if let Some(win) = self.meta.windows.first_mut() {
             win.layout = split_layout(win.layout.clone(), target_id, new_id, dir);
             win.panes.push(pane_meta);
@@ -173,7 +172,6 @@ impl ServerSession {
     }
 }
 
-/// Global server state — one session per named pipe.
 pub struct ServerState {
     pub sessions: HashMap<String, ServerSession>,
 }

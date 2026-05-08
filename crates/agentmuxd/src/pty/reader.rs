@@ -4,7 +4,6 @@ use std::io::Read;
 use tokio::sync::mpsc;
 
 /// Bridges portable-pty's blocking reader to a tokio channel.
-/// Must be called with a cloned reader from `master.try_clone_reader()`.
 pub fn spawn_reader(master: &dyn MasterPty) -> anyhow::Result<mpsc::Receiver<Bytes>> {
     let mut reader = master
         .try_clone_reader()

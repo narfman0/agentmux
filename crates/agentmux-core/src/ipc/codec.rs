@@ -1,5 +1,4 @@
 /// Length-delimited bincode framing for IPC messages.
-///
 /// Wire format: [u32 LE length][bincode payload]
 use std::io;
 
@@ -22,8 +21,8 @@ impl<T: Serialize> Encoder<T> for MsgCodec<T> {
     type Error = io::Error;
 
     fn encode(&mut self, item: T, dst: &mut BytesMut) -> io::Result<()> {
-        let payload =
-            bincode::serde::encode_to_vec(&item, standard()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let payload = bincode::serde::encode_to_vec(&item, standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         dst.put_u32_le(payload.len() as u32);
         dst.extend_from_slice(&payload);
         Ok(())

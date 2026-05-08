@@ -1,6 +1,12 @@
 use std::io;
 use std::time::Duration;
 
+use agentmux_core::{
+    config::load_config,
+    ipc::client::connect_with_retry,
+    protocol::{ClientMsg, ScreenSnapshot, ServerMsg},
+    session::{PaneId, Session},
+};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, EventStream, KeyEventKind},
@@ -16,11 +22,10 @@ use ratatui::{
     text::{Line, Span},
     Terminal,
 };
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     client::input::{handle_key, Action, InputMode},
-    config::loader,
-    pane::PaneState,
     tui::widgets::{
         agent_picker::AgentPicker,
         dashboard::{Dashboard, DashboardItem},
@@ -29,46 +34,34 @@ use crate::{
     },
 };
 
+// ---------------------------------------------------------------------------
+// Data model
+// ---------------------------------------------------------------------------
+
+pub struct RemotePane {
+    pub pane_id: PaneId,
+    pub agent_name: String,
+    pub name: Option<String>,
+    pub snapshot: ScreenSnapshot,
+}
+
+impl RemotePane {
+    pub fn label(&self) -> String {
+        self.name.as_deref().unwrap_or(&self.agent_name).to_string()
+    }
+}
+
 pub struct AppState {
-    pub panes: Vec<PaneState>,
+    pub panes: Vec<RemotePane>,
     pub selected: usize,
     pub broadcast: bool,
-    pub default_cwd: Option<String>,
     pub title: String,
+    pub cmd_tx: UnboundedSender<ClientMsg>,
 }
 
 impl AppState {
-    pub fn new(initial_cmd: &str, initial_args: &[&str], cols: u16, rows: u16, cwd: Option<String>) -> Result<Self> {
-        let pane = PaneState::new(initial_cmd, initial_args, cols, rows, cwd.as_deref())?;
-        Ok(Self {
-            panes: vec![pane],
-            selected: 0,
-            broadcast: false,
-            default_cwd: cwd,
-            title: String::new(),
-        })
-    }
-
-    fn selected_pane_mut(&mut self) -> Option<&mut PaneState> {
-        self.panes.get_mut(self.selected)
-    }
-
-    fn add_pane(&mut self, cmd: &str, args: &[&str], agent_cwd: Option<&str>, cols: u16, rows: u16) -> Result<()> {
-        let effective_cwd = agent_cwd.or(self.default_cwd.as_deref());
-        let pane = PaneState::new(cmd, args, cols, rows, effective_cwd)?;
-        self.panes.push(pane);
-        self.selected = self.panes.len() - 1;
-        Ok(())
-    }
-
-    fn remove_selected(&mut self) {
-        if self.panes.is_empty() {
-            return;
-        }
-        self.panes.remove(self.selected);
-        if self.selected >= self.panes.len() && !self.panes.is_empty() {
-            self.selected = self.panes.len() - 1;
-        }
+    fn selected_pane_id(&self) -> Option<PaneId> {
+        self.panes.get(self.selected).map(|p| p.pane_id)
     }
 
     fn navigate(&mut self, delta_row: i32, delta_col: i32, grid_cols: usize) {
@@ -80,25 +73,76 @@ impl AppState {
         let col = (self.selected % grid_cols) as i32 + delta_col;
         let rows = n.div_ceil(grid_cols) as i32;
         let cols = grid_cols as i32;
-
         let new_row = row.clamp(0, rows - 1) as usize;
         let new_col = col.clamp(0, cols - 1) as usize;
-        let idx = (new_row * grid_cols + new_col).min(n - 1);
-        self.selected = idx;
+        self.selected = (new_row * grid_cols + new_col).min(n - 1);
     }
 }
 
-pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> Result<()> {
-    let cfg = loader::load();
-    loader::ensure_example_config();
+// ---------------------------------------------------------------------------
+// Session sync helpers
+// ---------------------------------------------------------------------------
+
+fn sync_panes_from_session(state: &mut AppState, session: &Session, current_size: (u16, u16)) {
+    let all_panes: Vec<_> = session.windows.iter().flat_map(|w| w.panes.iter()).collect();
+
+    for p in &all_panes {
+        if !state.panes.iter().any(|rp| rp.pane_id == p.id) {
+            let _ = state.cmd_tx.send(ClientMsg::SubscribePaneOutput { pane_id: p.id });
+            let gc = Dashboard::grid_cols(state.panes.len() + 1);
+            let (cols, rows) = thumb_size(current_size, state.panes.len() + 1, gc);
+            let _ = state.cmd_tx.send(ClientMsg::ResizePane { pane_id: p.id, cols, rows });
+            state.panes.push(RemotePane {
+                pane_id: p.id,
+                agent_name: p.agent_name.clone(),
+                name: if p.name != p.agent_name { Some(p.name.clone()) } else { None },
+                snapshot: ScreenSnapshot::blank(cols, rows),
+            });
+        }
+    }
+
+    let live: Vec<PaneId> = all_panes.iter().map(|p| p.id).collect();
+    state.panes.retain(|rp| live.contains(&rp.pane_id));
+
+    if state.selected >= state.panes.len() && !state.panes.is_empty() {
+        state.selected = state.panes.len() - 1;
+    }
+}
+
+fn handle_server_msg(msg: ServerMsg, state: &mut AppState, current_size: (u16, u16)) {
+    match msg {
+        ServerMsg::Attached { session } | ServerMsg::SessionUpdated { session } => {
+            sync_panes_from_session(state, &session, current_size);
+        }
+        ServerMsg::PaneOutput(po) => {
+            if let Some(pane) = state.panes.iter_mut().find(|p| p.pane_id == po.pane_id) {
+                pane.snapshot = po.snapshot;
+            }
+        }
+        ServerMsg::PaneExited { pane_id } => {
+            state.panes.retain(|p| p.pane_id != pane_id);
+            if state.selected >= state.panes.len() && !state.panes.is_empty() {
+                state.selected = state.panes.len() - 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main run loop
+// ---------------------------------------------------------------------------
+
+pub async fn run(session_name: &str) -> Result<()> {
+    let cfg = load_config();
 
     let agent_names: Vec<String> = if cfg.agent.is_empty() {
-        vec![initial_cmd.to_string()]
+        vec!["claude".to_string()]
     } else {
         cfg.agent.iter().map(|a| a.name.clone()).collect()
     };
     let agent_commands: Vec<String> = if cfg.agent.is_empty() {
-        vec![initial_cmd.to_string()]
+        vec!["claude".to_string()]
     } else {
         cfg.agent.iter().map(|a| a.command.clone()).collect()
     };
@@ -113,15 +157,21 @@ pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> 
         cfg.agent.iter().map(|a| a.cwd.clone()).collect()
     };
 
-    let term_size = crossterm::terminal::size().unwrap_or((220, 50));
-    let pane_cols = term_size.0.saturating_sub(2).max(1);
-    let pane_rows = term_size.1.saturating_sub(3).max(1); // reserve status + border
+    let ipc = connect_with_retry(session_name).await?;
+    let mut event_rx = ipc.event_rx;
+    let cmd_tx = ipc.cmd_tx;
 
-    let initial_args: Vec<String> = agent_args.first().cloned().unwrap_or_default();
-    let initial_args_refs: Vec<&str> = initial_args.iter().map(|s| s.as_str()).collect();
-    let mut state = AppState::new(initial_cmd, &initial_args_refs, pane_cols, pane_rows, cwd)?;
-    state.title = session_name.to_string();
-    let mut current_size = term_size;
+    let _ = cmd_tx.send(ClientMsg::AttachSession { name: session_name.to_string() });
+
+    let mut state = AppState {
+        panes: Vec::new(),
+        selected: 0,
+        broadcast: false,
+        title: session_name.to_string(),
+        cmd_tx,
+    };
+
+    let mut current_size = crossterm::terminal::size().unwrap_or((220, 50));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -136,17 +186,8 @@ pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> 
 
     let result: Result<()> = async {
         loop {
-            if state.panes.is_empty() {
-                break;
-            }
-
             tokio::select! {
                 _ = tick.tick() => {
-                    // Refresh snapshots only for panes with new output since last tick.
-                    for pane in &mut state.panes {
-                        pane.refresh_snapshot();
-                    }
-
                     let sel = state.selected;
                     let broadcast = state.broadcast;
                     let grid_cols = Dashboard::grid_cols(state.panes.len());
@@ -157,18 +198,19 @@ pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> 
                             .direction(Direction::Vertical)
                             .constraints([Constraint::Min(1), Constraint::Length(1)])
                             .split(area);
-
                         let content_area = chunks[0];
-                        let status_area = chunks[1];
+                        let status_area  = chunks[1];
 
                         match &mode {
-                            InputMode::Dashboard | InputMode::AgentPicker { .. } | InputMode::StartParams { .. } => {
+                            InputMode::Dashboard
+                            | InputMode::AgentPicker { .. }
+                            | InputMode::StartParams { .. } => {
                                 let dash_chunks = RLayout::default()
                                     .direction(Direction::Vertical)
                                     .constraints([Constraint::Length(1), Constraint::Min(1)])
                                     .split(content_area);
                                 let title_area = dash_chunks[0];
-                                let grid_area = dash_chunks[1];
+                                let grid_area  = dash_chunks[1];
 
                                 render_session_title(title_area, f.buffer_mut(), &state.title);
 
@@ -176,7 +218,6 @@ pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> 
                                     .enumerate()
                                     .map(|(i, p)| format!("[{}] {}", i + 1, p.label()))
                                     .collect();
-
                                 let items: Vec<DashboardItem> = state.panes.iter()
                                     .enumerate()
                                     .map(|(i, pane)| DashboardItem {
@@ -189,14 +230,10 @@ pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> 
 
                                 Dashboard { items, cols: grid_cols }.render(grid_area, f.buffer_mut());
 
-                                if let InputMode::AgentPicker { selected: picker_sel, .. } = &mode {
-                                    AgentPicker {
-                                        agents: &agent_names,
-                                        selected: *picker_sel,
-                                    }
-                                    .render_popup(grid_area, f.buffer_mut());
+                                if let InputMode::AgentPicker { selected: ps, .. } = &mode {
+                                    AgentPicker { agents: &agent_names, selected: *ps }
+                                        .render_popup(grid_area, f.buffer_mut());
                                 }
-
                                 if let InputMode::StartParams { cmd, args, cwd, title, focused } = &mode {
                                     StartParamsModal { cmd, args, cwd, title, focused: *focused }
                                         .render_popup(grid_area, f.buffer_mut());
@@ -221,31 +258,19 @@ pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> 
                                         f.set_cursor_position((cx, cy));
                                     }
                                 }
-
-                                render_detail_status(
-                                    status_area,
-                                    f.buffer_mut(),
+                                render_detail_status(status_area, f.buffer_mut(),
                                     state.panes.get(sel).map(|p| p.label()).as_deref().unwrap_or(""),
-                                    broadcast,
-                                );
+                                    broadcast);
                             }
 
                             InputMode::Rename { buf } | InputMode::RenameTitle { buf } => {
-                                let is_title_rename = matches!(&mode, InputMode::RenameTitle { .. });
+                                let is_title = matches!(&mode, InputMode::RenameTitle { .. });
                                 let dash_chunks = RLayout::default()
                                     .direction(Direction::Vertical)
                                     .constraints([Constraint::Length(1), Constraint::Min(1)])
                                     .split(content_area);
-                                let title_area = dash_chunks[0];
-                                let grid_area = dash_chunks[1];
-
-                                let display_title = if is_title_rename {
-                                    format!("{}_", buf)
-                                } else {
-                                    state.title.clone()
-                                };
-                                render_session_title(title_area, f.buffer_mut(), &display_title);
-
+                                let display_title = if is_title { format!("{}_", buf) } else { state.title.clone() };
+                                render_session_title(dash_chunks[0], f.buffer_mut(), &display_title);
                                 let labels: Vec<String> = state.panes.iter()
                                     .enumerate()
                                     .map(|(i, p)| format!("[{}] {}", i + 1, p.label()))
@@ -253,14 +278,12 @@ pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> 
                                 let items: Vec<DashboardItem> = state.panes.iter()
                                     .enumerate()
                                     .map(|(i, pane)| DashboardItem {
-                                        snapshot: &pane.snapshot,
-                                        title: &labels[i],
-                                        selected: i == sel,
-                                        broadcast,
+                                        snapshot: &pane.snapshot, title: &labels[i],
+                                        selected: i == sel, broadcast,
                                     })
                                     .collect();
-                                Dashboard { items, cols: grid_cols }.render(grid_area, f.buffer_mut());
-                                if is_title_rename {
+                                Dashboard { items, cols: grid_cols }.render(dash_chunks[1], f.buffer_mut());
+                                if is_title {
                                     render_rename_title_status(status_area, f.buffer_mut());
                                 } else {
                                     render_rename_status(status_area, f.buffer_mut(), buf);
@@ -296,51 +319,36 @@ pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> 
                                         Action::DashboardSelect => {
                                             if !state.panes.is_empty() {
                                                 mode = InputMode::Detail;
-                                                // Resize selected pane to full content area on enter
                                                 let (cols, rows) = current_size;
                                                 let pc = cols.saturating_sub(2).max(1);
                                                 let pr = rows.saturating_sub(3).max(1);
-                                                if let Some(p) = state.selected_pane_mut() {
-                                                    p.resize(pc, pr);
+                                                if let Some(id) = state.selected_pane_id() {
+                                                    let _ = state.cmd_tx.send(ClientMsg::ResizePane { pane_id: id, cols: pc, rows: pr });
                                                 }
                                             }
                                         }
 
                                         Action::BackToDashboard => {
                                             mode = InputMode::Dashboard;
-                                            // Resize pane back to thumbnail size
-                                            resize_all_for_dashboard(&mut state, current_size, grid_cols);
+                                            resize_all_for_dashboard(&state, current_size, grid_cols);
                                         }
 
                                         Action::AddPane => {
-                                            let count = agent_names.len().max(1);
-                                            mode = InputMode::AgentPicker { selected: 0, count };
+                                            mode = InputMode::AgentPicker { selected: 0, count: agent_names.len().max(1) };
                                         }
 
                                         Action::PickerConfirm(idx) => {
-                                            let cmd = agent_commands.get(idx).map(|s| s.as_str()).unwrap_or(initial_cmd);
-                                            let empty: Vec<String> = vec![];
-                                            let args_strs = agent_args.get(idx).unwrap_or(&empty);
-                                            let args_refs: Vec<&str> = args_strs.iter().map(|s| s.as_str()).collect();
-                                            let agent_cwd = agent_cwds.get(idx).and_then(|c| c.as_deref());
-                                            let gc = Dashboard::grid_cols(state.panes.len() + 1);
-                                            let (tc, tr) = thumbnail_size(current_size, state.panes.len() + 1, gc);
-                                            state.add_pane(cmd, &args_refs, agent_cwd, tc, tr)?;
-                                            let (cols, rows) = current_size;
-                                            let pc = cols.saturating_sub(2).max(1);
-                                            let pr = rows.saturating_sub(3).max(1);
-                                            if let Some(p) = state.selected_pane_mut() {
-                                                p.resize(pc, pr);
-                                            }
-                                            mode = InputMode::Detail;
+                                            let cmd  = agent_commands.get(idx).cloned().unwrap_or_default();
+                                            let args = agent_args.get(idx).cloned().unwrap_or_default();
+                                            let cwd  = agent_cwds.get(idx).cloned().unwrap_or(None);
+                                            let _ = state.cmd_tx.send(ClientMsg::SpawnPane { cmd, args, cwd });
+                                            mode = InputMode::Dashboard;
                                         }
 
                                         Action::PickerCancel | Action::PickerUp | Action::PickerDown => {}
 
                                         Action::StartRename => {
-                                            let current = state.panes.get(state.selected)
-                                                .map(|p: &PaneState| p.label())
-                                                .unwrap_or_default();
+                                            let current = state.panes.get(state.selected).map(|p| p.label()).unwrap_or_default();
                                             mode = InputMode::Rename { buf: current };
                                         }
 
@@ -357,41 +365,25 @@ pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> 
                                         }
 
                                         Action::ConfirmRenameTitle(name) => {
-                                            if !name.is_empty() {
-                                                state.title = name;
-                                            }
+                                            if !name.is_empty() { state.title = name; }
                                         }
 
                                         Action::CancelRenameTitle => {}
 
                                         Action::OpenStartParams => {
                                             mode = InputMode::StartParams {
-                                                cmd: String::new(),
-                                                args: String::new(),
-                                                cwd: String::new(),
-                                                title: String::new(),
-                                                focused: 0,
+                                                cmd: String::new(), args: String::new(),
+                                                cwd: String::new(), title: String::new(), focused: 0,
                                             };
                                         }
 
                                         Action::StartParamsConfirm { cmd, args: args_str, cwd, title } => {
-                                            let parsed: Vec<String> = args_str.split_whitespace().map(String::from).collect();
-                                            let args_refs: Vec<&str> = parsed.iter().map(|s| s.as_str()).collect();
-                                            let effective_cwd = if cwd.is_empty() { None } else { Some(cwd.as_str()) };
-                                            let gc = Dashboard::grid_cols(state.panes.len() + 1);
-                                            let (tc, tr) = thumbnail_size(current_size, state.panes.len() + 1, gc);
                                             if !cmd.is_empty() {
-                                                state.add_pane(&cmd, &args_refs, effective_cwd, tc, tr)?;
-                                                if !title.is_empty() {
-                                                    state.title = title;
-                                                }
-                                                let (cols, rows) = current_size;
-                                                let pc = cols.saturating_sub(2).max(1);
-                                                let pr = rows.saturating_sub(3).max(1);
-                                                if let Some(p) = state.selected_pane_mut() {
-                                                    p.resize(pc, pr);
-                                                }
-                                                mode = InputMode::Detail;
+                                                let args = args_str.split_whitespace().map(String::from).collect();
+                                                let cwd_opt = if cwd.is_empty() { None } else { Some(cwd) };
+                                                let _ = state.cmd_tx.send(ClientMsg::SpawnPane { cmd, args, cwd: cwd_opt });
+                                                if !title.is_empty() { state.title = title; }
+                                                mode = InputMode::Dashboard;
                                             }
                                         }
 
@@ -404,16 +396,15 @@ pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> 
                                                 let (cols, rows) = current_size;
                                                 let pc = cols.saturating_sub(2).max(1);
                                                 let pr = rows.saturating_sub(3).max(1);
-                                                if let Some(p) = state.selected_pane_mut() {
-                                                    p.resize(pc, pr);
+                                                if let Some(id) = state.selected_pane_id() {
+                                                    let _ = state.cmd_tx.send(ClientMsg::ResizePane { pane_id: id, cols: pc, rows: pr });
                                                 }
                                             }
                                         }
 
                                         Action::RemovePane => {
-                                            state.remove_selected();
-                                            if state.panes.is_empty() {
-                                                return Ok(());
+                                            if let Some(id) = state.selected_pane_id() {
+                                                let _ = state.cmd_tx.send(ClientMsg::ClosePane { pane_id: id });
                                             }
                                         }
 
@@ -423,11 +414,13 @@ pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> 
 
                                         Action::PaneInput(bytes) => {
                                             if state.broadcast {
-                                                for p in &mut state.panes {
-                                                    let _ = p.write_input(&bytes);
+                                                for p in &state.panes {
+                                                    let _ = state.cmd_tx.send(ClientMsg::PaneInput {
+                                                        pane_id: p.pane_id, data: bytes.clone(),
+                                                    });
                                                 }
-                                            } else if let Some(p) = state.selected_pane_mut() {
-                                                p.write_input(&bytes)?;
+                                            } else if let Some(id) = state.selected_pane_id() {
+                                                let _ = state.cmd_tx.send(ClientMsg::PaneInput { pane_id: id, data: bytes });
                                             }
                                         }
                                     }
@@ -441,16 +434,23 @@ pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> 
                                     InputMode::Detail => {
                                         let pc = cols.saturating_sub(2).max(1);
                                         let pr = rows.saturating_sub(3).max(1);
-                                        if let Some(p) = state.selected_pane_mut() {
-                                            p.resize(pc, pr);
+                                        if let Some(id) = state.selected_pane_id() {
+                                            let _ = state.cmd_tx.send(ClientMsg::ResizePane { pane_id: id, cols: pc, rows: pr });
                                         }
                                     }
-                                    _ => resize_all_for_dashboard(&mut state, (cols, rows), grid_cols),
+                                    _ => resize_all_for_dashboard(&state, (cols, rows), grid_cols),
                                 }
                             }
 
                             _ => {}
                         }
+                    }
+                }
+
+                maybe_ipc = event_rx.recv() => {
+                    match maybe_ipc {
+                        None => break,
+                        Some(msg) => handle_server_msg(msg, &mut state, current_size),
                     }
                 }
             }
@@ -459,29 +459,37 @@ pub async fn run(initial_cmd: &str, session_name: &str, cwd: Option<String>) -> 
     }
     .await;
 
-
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-
     result
 }
 
-fn thumbnail_size(term: (u16, u16), n: usize, grid_cols: usize) -> (u16, u16) {
+// ---------------------------------------------------------------------------
+// Resize helpers
+// ---------------------------------------------------------------------------
+
+fn thumb_size(term: (u16, u16), n: usize, grid_cols: usize) -> (u16, u16) {
     let rows_count = n.div_ceil(grid_cols) as u16;
     let cell_w = (term.0 / grid_cols as u16).saturating_sub(2).max(1);
-    // subtract 2: 1 for status bar + 1 for session title bar
     let cell_h = ((term.1.saturating_sub(2)) / rows_count).saturating_sub(2).max(1);
     (cell_w, cell_h)
 }
 
-fn resize_all_for_dashboard(state: &mut AppState, term: (u16, u16), grid_cols: usize) {
+fn resize_all_for_dashboard(state: &AppState, term: (u16, u16), grid_cols: usize) {
     let n = state.panes.len();
-    let (tc, tr) = thumbnail_size(term, n, grid_cols);
-    for p in &mut state.panes {
-        p.resize(tc, tr);
+    if n == 0 {
+        return;
+    }
+    let (tc, tr) = thumb_size(term, n, grid_cols);
+    for pane in &state.panes {
+        let _ = state.cmd_tx.send(ClientMsg::ResizePane { pane_id: pane.pane_id, cols: tc, rows: tr });
     }
 }
+
+// ---------------------------------------------------------------------------
+// Status bar renderers
+// ---------------------------------------------------------------------------
 
 fn render_session_title(area: Rect, buf: &mut ratatui::buffer::Buffer, title: &str) {
     let amber = Color::Rgb(255, 176, 0);
@@ -493,12 +501,8 @@ fn render_session_title(area: Rect, buf: &mut ratatui::buffer::Buffer, title: &s
 fn render_dashboard_status(area: Rect, buf: &mut ratatui::buffer::Buffer, broadcast: bool) {
     let bg = Style::default().bg(Color::DarkGray).fg(Color::White);
     for x in area.x..area.x + area.width {
-        if let Some(c) = buf.cell_mut((x, area.y)) {
-            c.set_char(' ');
-            c.set_style(bg);
-        }
+        if let Some(c) = buf.cell_mut((x, area.y)) { c.set_char(' '); c.set_style(bg); }
     }
-
     let mut spans = vec![
         Span::styled(" DASHBOARD ", Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::styled("  ↑↓←→/hjkl: navigate  1-9: open  Enter: open  n: new  N: custom  x: close  r: rename", bg),
@@ -514,42 +518,31 @@ fn render_dashboard_status(area: Rect, buf: &mut ratatui::buffer::Buffer, broadc
 fn render_rename_title_status(area: Rect, buf: &mut ratatui::buffer::Buffer) {
     let bg = Style::default().bg(Color::DarkGray).fg(Color::White);
     for x in area.x..area.x + area.width {
-        if let Some(c) = buf.cell_mut((x, area.y)) {
-            c.set_char(' ');
-            c.set_style(bg);
-        }
+        if let Some(c) = buf.cell_mut((x, area.y)) { c.set_char(' '); c.set_style(bg); }
     }
-    let spans = vec![
+    Line::from(vec![
         Span::styled(" RENAME TITLE ", Style::default().bg(Color::Rgb(255, 176, 0)).fg(Color::Black).add_modifier(Modifier::BOLD)),
         Span::styled("  Type new title  Enter: confirm  Esc: cancel", Style::default().bg(Color::DarkGray).fg(Color::Gray)),
-    ];
-    Line::from(spans).render(area, buf);
+    ]).render(area, buf);
 }
 
 fn render_rename_status(area: Rect, buf: &mut ratatui::buffer::Buffer, input: &str) {
     let bg = Style::default().bg(Color::DarkGray).fg(Color::White);
     for x in area.x..area.x + area.width {
-        if let Some(c) = buf.cell_mut((x, area.y)) {
-            c.set_char(' ');
-            c.set_style(bg);
-        }
+        if let Some(c) = buf.cell_mut((x, area.y)) { c.set_char(' '); c.set_style(bg); }
     }
-    let spans = vec![
+    Line::from(vec![
         Span::styled(" RENAME ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)),
         Span::styled("  New name: ", bg),
         Span::styled(format!("{}_", input), Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::styled("  Enter: confirm  Esc: cancel", Style::default().bg(Color::DarkGray).fg(Color::Gray)),
-    ];
-    Line::from(spans).render(area, buf);
+    ]).render(area, buf);
 }
 
 fn render_detail_status(area: Rect, buf: &mut ratatui::buffer::Buffer, agent: &str, broadcast: bool) {
     let bg = Style::default().bg(Color::DarkGray).fg(Color::White);
     for x in area.x..area.x + area.width {
-        if let Some(c) = buf.cell_mut((x, area.y)) {
-            c.set_char(' ');
-            c.set_style(bg);
-        }
+        if let Some(c) = buf.cell_mut((x, area.y)) { c.set_char(' '); c.set_style(bg); }
     }
     let mut spans = vec![
         Span::styled(format!(" {} ", agent), Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)),

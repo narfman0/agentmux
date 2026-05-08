@@ -2,11 +2,10 @@ use agentmux_core::session::{Layout, PaneId};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SplitDir {
-    Horizontal, // left | right
-    Vertical,   // top / bottom
+    Horizontal,
+    Vertical,
 }
 
-/// Split the leaf containing `target`, inserting `new_id` as a sibling.
 pub fn split_layout(layout: Layout, target: PaneId, new_id: PaneId, dir: SplitDir) -> Layout {
     match layout {
         Layout::Leaf(id) if id == target => match dir {
@@ -35,8 +34,6 @@ pub fn split_layout(layout: Layout, target: PaneId, new_id: PaneId, dir: SplitDi
     }
 }
 
-/// Remove a pane from the layout. Returns None if the whole tree was removed.
-/// When one side of a split is removed, the other side takes the full space.
 pub fn remove_from_layout(layout: Layout, target: PaneId) -> Option<Layout> {
     match layout {
         Layout::Leaf(id) if id == target => None,

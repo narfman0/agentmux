@@ -9,7 +9,6 @@ use tokio::sync::mpsc;
 use crate::pty::reader::spawn_reader;
 use crate::vt::screen::Screen;
 
-/// A channel endpoint for sending ServerMsg to a connected client.
 pub type ClientTx = mpsc::Sender<ServerMsg>;
 
 pub struct PaneShared {
@@ -34,7 +33,6 @@ impl PaneShared {
     }
 }
 
-/// Spawns the tokio task that feeds PTY output into vt100 and pushes snapshots.
 pub fn spawn(
     pane_id: PaneId,
     master: &dyn portable_pty::MasterPty,
@@ -47,7 +45,7 @@ pub fn spawn(
     tokio::spawn(async move {
         let mut screen = Screen::new(rows, cols);
         let mut last_sent = Instant::now();
-        let throttle = Duration::from_millis(33); // ~30 fps max
+        let throttle = Duration::from_millis(33);
 
         while let Some(data) = rx.recv().await {
             screen.feed(&data);

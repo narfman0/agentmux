@@ -32,6 +32,8 @@ pub enum ClientMsg {
     BroadcastInput { session_id: SessionId, data: Vec<u8> },
     SubscribePaneOutput { pane_id: PaneId },
     UnsubscribePaneOutput { pane_id: PaneId },
+    /// Spawn a new pane with an arbitrary command (server picks split target).
+    SpawnPane { cmd: String, args: Vec<String>, cwd: Option<String> },
 }
 
 /// Payload for ServerMsg::PaneOutput — extracted so pane_task can construct it directly.
