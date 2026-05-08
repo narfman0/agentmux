@@ -8,6 +8,10 @@ pub enum InputMode {
     Detail,
     /// Agent picker overlay (Ctrl+A n from dashboard).
     AgentPicker { selected: usize, count: usize },
+    /// Inline rename prompt for the focused pane.
+    Rename { buf: String },
+    /// Custom-params form for spawning a pane with arbitrary command/args/cwd.
+    StartParams { cmd: String, args: String, cwd: String, focused: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +35,19 @@ pub enum Action {
     // Detail mode
     BackToDashboard,   // Escape → Dashboard mode
     PaneInput(Vec<u8>), // pass-through to PTY
+
+    // Rename
+    StartRename,
+    ConfirmRename(String),
+    CancelRename,
+
+    // Direct pane jump (0-indexed)
+    SelectPane(usize),
+
+    // Start-params form
+    OpenStartParams,
+    StartParamsConfirm { cmd: String, args: String, cwd: String },
+    StartParamsCancel,
 
     Quit,
 }
@@ -70,9 +87,14 @@ pub fn handle_key(mode: &mut InputMode, ev: KeyEvent) -> Option<Action> {
             KeyCode::Right => Some(Action::DashboardRight),
             KeyCode::Enter                       => Some(Action::DashboardSelect),
             KeyCode::Char('n')                   => Some(Action::AddPane),
+            KeyCode::Char('N')                   => Some(Action::OpenStartParams),
             KeyCode::Char('x')                   => Some(Action::RemovePane),
             KeyCode::Char('b')                   => Some(Action::ToggleBroadcast),
+            KeyCode::Char('r')                   => Some(Action::StartRename),
             KeyCode::Char('q') | KeyCode::Esc   => Some(Action::Quit),
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                Some(Action::SelectPane((c as usize) - ('1' as usize)))
+            }
             _ => None,
         },
 
@@ -81,9 +103,82 @@ pub fn handle_key(mode: &mut InputMode, ev: KeyEvent) -> Option<Action> {
                 *mode = InputMode::Dashboard;
                 return Some(Action::BackToDashboard);
             }
+            if let KeyCode::Char(c) = ev.code {
+                if ev.modifiers == KeyModifiers::ALT && c.is_ascii_digit() && c != '0' {
+                    return Some(Action::SelectPane((c as usize) - ('1' as usize)));
+                }
+            }
             let bytes = keyevent_to_bytes(ev);
             if bytes.is_empty() { None } else { Some(Action::PaneInput(bytes)) }
         }
+
+        InputMode::Rename { buf } => match ev.code {
+            KeyCode::Enter => {
+                let name = buf.clone();
+                *mode = InputMode::Dashboard;
+                Some(Action::ConfirmRename(name))
+            }
+            KeyCode::Esc => {
+                *mode = InputMode::Dashboard;
+                Some(Action::CancelRename)
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                None
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                None
+            }
+            _ => None,
+        },
+
+        InputMode::StartParams { cmd, args, cwd, focused } => match ev.code {
+            KeyCode::Tab => {
+                *focused = (*focused + 1) % 3;
+                None
+            }
+            KeyCode::BackTab => {
+                *focused = (*focused + 2) % 3;
+                None
+            }
+            KeyCode::Down => {
+                if *focused < 2 { *focused += 1; }
+                None
+            }
+            KeyCode::Up => {
+                if *focused > 0 { *focused -= 1; }
+                None
+            }
+            KeyCode::Enter => {
+                let c = cmd.clone();
+                let a = args.clone();
+                let d = cwd.clone();
+                *mode = InputMode::Dashboard;
+                Some(Action::StartParamsConfirm { cmd: c, args: a, cwd: d })
+            }
+            KeyCode::Esc => {
+                *mode = InputMode::Dashboard;
+                Some(Action::StartParamsCancel)
+            }
+            KeyCode::Backspace => {
+                match *focused {
+                    0 => { cmd.pop(); }
+                    1 => { args.pop(); }
+                    _ => { cwd.pop(); }
+                }
+                None
+            }
+            KeyCode::Char(c) if ev.modifiers == KeyModifiers::NONE || ev.modifiers == KeyModifiers::SHIFT => {
+                match *focused {
+                    0 => cmd.push(c),
+                    1 => args.push(c),
+                    _ => cwd.push(c),
+                }
+                None
+            }
+            _ => None,
+        },
     }
 }
 

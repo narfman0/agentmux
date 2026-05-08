@@ -25,6 +25,7 @@ use crate::{
         agent_picker::AgentPicker,
         dashboard::{Dashboard, DashboardItem},
         pane_view::PaneView,
+        start_params::StartParamsModal,
     },
 };
 
@@ -138,6 +139,11 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
 
             tokio::select! {
                 _ = tick.tick() => {
+                    // Refresh snapshots only for panes with new output since last tick.
+                    for pane in &mut state.panes {
+                        pane.refresh_snapshot();
+                    }
+
                     let sel = state.selected;
                     let broadcast = state.broadcast;
                     let grid_cols = Dashboard::grid_cols(state.panes.len());
@@ -153,19 +159,16 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
                         let status_area = chunks[1];
 
                         match &mode {
-                            InputMode::Dashboard | InputMode::AgentPicker { .. } => {
-                                let snapshots: Vec<_> = state.panes.iter()
-                                    .map(|p| p.snapshot.lock().unwrap().clone())
-                                    .collect();
+                            InputMode::Dashboard | InputMode::AgentPicker { .. } | InputMode::StartParams { .. } => {
                                 let labels: Vec<String> = state.panes.iter()
                                     .enumerate()
                                     .map(|(i, p)| format!("[{}] {}", i + 1, p.label()))
                                     .collect();
 
-                                let items: Vec<DashboardItem> = snapshots.iter()
+                                let items: Vec<DashboardItem> = state.panes.iter()
                                     .enumerate()
-                                    .map(|(i, snap)| DashboardItem {
-                                        snapshot: snap,
+                                    .map(|(i, pane)| DashboardItem {
+                                        snapshot: &pane.snapshot,
                                         title: &labels[i],
                                         selected: i == sel,
                                         broadcast,
@@ -174,7 +177,6 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
 
                                 Dashboard { items, cols: grid_cols }.render(content_area, f.buffer_mut());
 
-                                // Agent picker overlay
                                 if let InputMode::AgentPicker { selected: picker_sel, .. } = &mode {
                                     AgentPicker {
                                         agents: &agent_names,
@@ -183,25 +185,27 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
                                     .render_popup(content_area, f.buffer_mut());
                                 }
 
-                                // Status bar: dashboard hint
+                                if let InputMode::StartParams { cmd, args, cwd, focused } = &mode {
+                                    StartParamsModal { cmd, args, cwd, focused: *focused }
+                                        .render_popup(content_area, f.buffer_mut());
+                                }
+
                                 render_dashboard_status(status_area, f.buffer_mut(), broadcast);
                             }
 
                             InputMode::Detail => {
-                                // Full-screen view of selected pane
                                 if let Some(pane) = state.panes.get(sel) {
-                                    let snap = pane.snapshot.lock().unwrap().clone();
                                     let label = format!("[{}] {}", sel + 1, pane.label());
-                                    PaneView { snapshot: &snap, focused: true, title: &label }
+                                    PaneView { snapshot: &pane.snapshot, focused: true, title: &label }
                                         .render(content_area, f.buffer_mut());
 
-                                    if !snap.cursor_hidden {
+                                    if !pane.snapshot.cursor_hidden {
                                         let ix = content_area.x + 1;
                                         let iy = content_area.y + 1;
                                         let max_x = content_area.x + content_area.width.saturating_sub(2);
                                         let max_y = content_area.y + content_area.height.saturating_sub(2);
-                                        let cx = (ix + snap.cursor_col).min(max_x);
-                                        let cy = (iy + snap.cursor_row).min(max_y);
+                                        let cx = (ix + pane.snapshot.cursor_col).min(max_x);
+                                        let cy = (iy + pane.snapshot.cursor_row).min(max_y);
                                         f.set_cursor_position((cx, cy));
                                     }
                                 }
@@ -215,17 +219,14 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
                             }
 
                             InputMode::Rename { buf } => {
-                                let snapshots: Vec<_> = state.panes.iter()
-                                    .map(|p| p.snapshot.lock().unwrap().clone())
-                                    .collect();
                                 let labels: Vec<String> = state.panes.iter()
                                     .enumerate()
                                     .map(|(i, p)| format!("[{}] {}", i + 1, p.label()))
                                     .collect();
-                                let items: Vec<DashboardItem> = snapshots.iter()
+                                let items: Vec<DashboardItem> = state.panes.iter()
                                     .enumerate()
-                                    .map(|(i, snap)| DashboardItem {
-                                        snapshot: snap,
+                                    .map(|(i, pane)| DashboardItem {
+                                        snapshot: &pane.snapshot,
                                         title: &labels[i],
                                         selected: i == sel,
                                         broadcast,
@@ -312,6 +313,28 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
                                         }
 
                                         Action::CancelRename => {}
+
+                                        Action::OpenStartParams => {
+                                            mode = InputMode::StartParams {
+                                                cmd: String::new(),
+                                                args: String::new(),
+                                                cwd: String::new(),
+                                                focused: 0,
+                                            };
+                                        }
+
+                                        Action::StartParamsConfirm { cmd, args: args_str, cwd } => {
+                                            let parsed: Vec<String> = args_str.split_whitespace().map(String::from).collect();
+                                            let args_refs: Vec<&str> = parsed.iter().map(|s| s.as_str()).collect();
+                                            let effective_cwd = if cwd.is_empty() { None } else { Some(cwd.as_str()) };
+                                            let gc = Dashboard::grid_cols(state.panes.len() + 1);
+                                            let (tc, tr) = thumbnail_size(current_size, state.panes.len() + 1, gc);
+                                            if !cmd.is_empty() {
+                                                state.add_pane(&cmd, &args_refs, effective_cwd, tc, tr)?;
+                                            }
+                                        }
+
+                                        Action::StartParamsCancel => {}
 
                                         Action::SelectPane(idx) => {
                                             if idx < state.panes.len() {
@@ -409,7 +432,7 @@ fn render_dashboard_status(area: Rect, buf: &mut ratatui::buffer::Buffer, broadc
 
     let mut spans = vec![
         Span::styled(" DASHBOARD ", Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled("  ↑↓←→/hjkl: navigate  1-9: open  Enter: open  n: new  x: close  r: rename", bg),
+        Span::styled("  ↑↓←→/hjkl: navigate  1-9: open  Enter: open  n: new  N: custom  x: close  r: rename", bg),
     ];
     if broadcast {
         spans.push(Span::styled("  [BROADCAST] ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)));
