@@ -9,20 +9,29 @@ use tokio_util::codec::Framed;
 
 use agentmux_core::protocol::{ClientMsg, ServerMsg};
 
+use crate::config::loader;
 use crate::ipc::codec::MsgCodec;
 use crate::ipc::transport::{next_server_instance, server_endpoint};
 use crate::layout_ops::SplitDir;
 use crate::server::session_mgr::ServerState;
 
 pub async fn run_server(session_name: String, initial_agent: String) -> Result<()> {
+    let cfg = loader::load();
     let state = Arc::new(Mutex::new(ServerState::new()));
 
     // Pre-create the first session with the initial agent.
     {
         let mut s = state.lock().unwrap();
+        let agent_cfg = cfg.agent.iter().find(|a| a.name == initial_agent || a.command == initial_agent);
+        let (cmd, args_owned) = match agent_cfg {
+            Some(a) => (a.command.clone(), a.args.clone()),
+            None => (initial_agent.clone(), vec![]),
+        };
+        let args_refs: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
         let session = crate::server::session_mgr::ServerSession::new(
             &session_name,
-            &initial_agent,
+            &cmd,
+            &args_refs,
             220,
             50,
         )?;
@@ -138,7 +147,7 @@ async fn dispatch(
                 agentmux_core::protocol::SplitDir::Horizontal => SplitDir::Horizontal,
                 agentmux_core::protocol::SplitDir::Vertical => SplitDir::Vertical,
             };
-            if let Ok(new_id) = sess.split_pane(pane_id, dir, &agent, 110, 50) {
+            if let Ok(new_id) = sess.split_pane(pane_id, dir, &agent, &[], 110, 50) {
                 // Subscribe the new pane to this client's push channel
                 sess.subscribe_pane(new_id, push_tx.clone());
                 let _ = push_tx.try_send(ServerMsg::SessionUpdated {

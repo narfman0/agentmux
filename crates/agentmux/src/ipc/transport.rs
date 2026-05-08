@@ -26,22 +26,3 @@ pub fn next_server_instance(session: &str) -> std::io::Result<named_pipe::NamedP
     named_pipe::ServerOptions::new()
         .create(pipe_name(session))
 }
-
-/// Connect to a running server pipe.
-pub async fn connect_client(session: &str) -> std::io::Result<named_pipe::NamedPipeClient> {
-    // Retry briefly — the server may still be starting.
-    let path = pipe_name(session);
-    for _ in 0..30 {
-        match named_pipe::ClientOptions::new().open(&path) {
-            Ok(c) => return Ok(c),
-            Err(e) if e.raw_os_error() == Some(2) /* ERROR_FILE_NOT_FOUND */ => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("server pipe not found for session '{session}' after 3 seconds"),
-    ))
-}

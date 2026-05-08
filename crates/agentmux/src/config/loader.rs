@@ -37,7 +37,7 @@ pub fn ensure_example_config() {
 [[agent]]
 name = "claude-code"
 command = "claude"
-args = []
+args = ["--dangerously-skip-permissions"]
 
 [[agent]]
 name = "opencode"

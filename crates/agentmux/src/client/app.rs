@@ -295,6 +295,13 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
                                             let gc = Dashboard::grid_cols(state.panes.len() + 1);
                                             let (tc, tr) = thumbnail_size(current_size, state.panes.len() + 1, gc);
                                             state.add_pane(cmd, &args_refs, agent_cwd, tc, tr)?;
+                                            let (cols, rows) = current_size;
+                                            let pc = cols.saturating_sub(2).max(1);
+                                            let pr = rows.saturating_sub(3).max(1);
+                                            if let Some(p) = state.selected_pane_mut() {
+                                                p.resize(pc, pr);
+                                            }
+                                            mode = InputMode::Detail;
                                         }
 
                                         Action::PickerCancel | Action::PickerUp | Action::PickerDown => {}
@@ -331,6 +338,13 @@ pub async fn run(initial_cmd: &str, cwd: Option<String>) -> Result<()> {
                                             let (tc, tr) = thumbnail_size(current_size, state.panes.len() + 1, gc);
                                             if !cmd.is_empty() {
                                                 state.add_pane(&cmd, &args_refs, effective_cwd, tc, tr)?;
+                                                let (cols, rows) = current_size;
+                                                let pc = cols.saturating_sub(2).max(1);
+                                                let pr = rows.saturating_sub(3).max(1);
+                                                if let Some(p) = state.selected_pane_mut() {
+                                                    p.resize(pc, pr);
+                                                }
+                                                mode = InputMode::Detail;
                                             }
                                         }
 

@@ -6,7 +6,7 @@ pub struct PtyHandle {
     pub child: Box<dyn portable_pty::Child + Send>,
 }
 
-pub fn spawn_agent(cmd: &str, args: &[&str], cols: u16, rows: u16) -> Result<PtyHandle> {
+pub fn spawn_agent(cmd: &str, args: &[&str], cols: u16, rows: u16, cwd: Option<&str>) -> Result<PtyHandle> {
     let pty_system = native_pty_system();
 
     let size = PtySize {
@@ -23,6 +23,9 @@ pub fn spawn_agent(cmd: &str, args: &[&str], cols: u16, rows: u16) -> Result<Pty
     let mut builder = CommandBuilder::new(cmd);
     for arg in args {
         builder.arg(arg);
+    }
+    if let Some(dir) = cwd {
+        builder.cwd(dir);
     }
 
     // Set TERM so agent TUIs enable full color/cursor sequences.

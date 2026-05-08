@@ -15,7 +15,8 @@ pub struct ServerPane {
     pub meta: Pane,
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     pub writer: Box<dyn Write + Send>,
-    pub child: Box<dyn portable_pty::Child + Send>,
+    // Held for its Drop impl — keeps the child process alive while the pane exists.
+    _child: Box<dyn portable_pty::Child + Send>,
     pub shared: Arc<PaneShared>,
 }
 
@@ -25,12 +26,12 @@ pub struct ServerSession {
 }
 
 impl ServerSession {
-    pub fn new(name: &str, agent_cmd: &str, cols: u16, rows: u16) -> anyhow::Result<Self> {
+    pub fn new(name: &str, agent_cmd: &str, agent_args: &[&str], cols: u16, rows: u16) -> anyhow::Result<Self> {
         let session_id: SessionId = Uuid::new_v4();
         let window_id: WindowId = Uuid::new_v4();
         let pane_id: PaneId = Uuid::new_v4();
 
-        let handle = spawn_agent(agent_cmd, &[], cols, rows)?;
+        let handle = spawn_agent(agent_cmd, agent_args, cols, rows, None)?;
         let writer = handle
             .master
             .take_writer()
@@ -71,7 +72,7 @@ impl ServerSession {
             meta: pane_meta,
             master: handle.master,
             writer,
-            child: handle.child,
+            _child: handle.child,
             shared,
         };
 
@@ -87,11 +88,12 @@ impl ServerSession {
         target_id: PaneId,
         dir: SplitDir,
         agent_cmd: &str,
+        agent_args: &[&str],
         cols: u16,
         rows: u16,
     ) -> anyhow::Result<PaneId> {
         let new_id: PaneId = Uuid::new_v4();
-        let handle = spawn_agent(agent_cmd, &[], cols, rows)?;
+        let handle = spawn_agent(agent_cmd, agent_args, cols, rows, None)?;
         let writer = handle
             .master
             .take_writer()
@@ -110,7 +112,7 @@ impl ServerSession {
 
         self.panes.insert(
             new_id,
-            ServerPane { meta: pane_meta.clone(), master: handle.master, writer, child: handle.child, shared },
+            ServerPane { meta: pane_meta.clone(), master: handle.master, writer, _child: handle.child, shared },
         );
 
         // Update the layout in the active window
