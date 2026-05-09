@@ -331,7 +331,8 @@ pub async fn run(session_name: &str) -> Result<()> {
                                         }
 
                                         Action::AddPane => {
-                                            mode = InputMode::AgentPicker { selected: 0, count: agent_names.len().max(1) };
+                                            // +1 for the "Custom command..." entry at the bottom
+                                            mode = InputMode::AgentPicker { selected: 0, count: agent_names.len() + 1 };
                                         }
 
                                         Action::AddPaneDirect => {
@@ -339,14 +340,24 @@ pub async fn run(session_name: &str) -> Result<()> {
                                             let args = agent_args.first().cloned().unwrap_or_default();
                                             let cwd  = agent_cwds.first().cloned().unwrap_or(None);
                                             let _ = state.cmd_tx.send(ClientMsg::SpawnPane { cmd, args, cwd });
+                                            state.pending_enter_new = true;
                                         }
 
                                         Action::PickerConfirm(idx) => {
-                                            let cmd  = agent_commands.get(idx).cloned().unwrap_or_default();
-                                            let args = agent_args.get(idx).cloned().unwrap_or_default();
-                                            let cwd  = agent_cwds.get(idx).cloned().unwrap_or(None);
-                                            let _ = state.cmd_tx.send(ClientMsg::SpawnPane { cmd, args, cwd });
-                                            mode = InputMode::Dashboard;
+                                            if idx == agent_names.len() {
+                                                // "Custom command..." selected — open the params form
+                                                mode = InputMode::StartParams {
+                                                    cmd: String::new(), args: String::new(),
+                                                    cwd: String::new(), title: String::new(), focused: 0,
+                                                };
+                                            } else {
+                                                let cmd  = agent_commands.get(idx).cloned().unwrap_or_default();
+                                                let args = agent_args.get(idx).cloned().unwrap_or_default();
+                                                let cwd  = agent_cwds.get(idx).cloned().unwrap_or(None);
+                                                let _ = state.cmd_tx.send(ClientMsg::SpawnPane { cmd, args, cwd });
+                                                state.pending_enter_new = true;
+                                                mode = InputMode::Dashboard;
+                                            }
                                         }
 
                                         Action::PickerCancel | Action::PickerUp | Action::PickerDown => {}
@@ -374,19 +385,13 @@ pub async fn run(session_name: &str) -> Result<()> {
 
                                         Action::CancelRenameTitle => {}
 
-                                        Action::OpenStartParams => {
-                                            mode = InputMode::StartParams {
-                                                cmd: String::new(), args: String::new(),
-                                                cwd: String::new(), title: String::new(), focused: 0,
-                                            };
-                                        }
-
                                         Action::StartParamsConfirm { cmd, args: args_str, cwd, title } => {
                                             if !cmd.is_empty() {
                                                 let args = args_str.split_whitespace().map(String::from).collect();
                                                 let cwd_opt = if cwd.is_empty() { None } else { Some(cwd) };
                                                 let _ = state.cmd_tx.send(ClientMsg::SpawnPane { cmd, args, cwd: cwd_opt });
                                                 if !title.is_empty() { state.title = title; }
+                                                state.pending_enter_new = true;
                                                 mode = InputMode::Dashboard;
                                             }
                                         }
@@ -444,7 +449,21 @@ pub async fn run(session_name: &str) -> Result<()> {
                 maybe_ipc = event_rx.recv() => {
                     match maybe_ipc {
                         None => break,
-                        Some(msg) => handle_server_msg(msg, &mut state, current_size),
+                        Some(msg) => {
+                            let old_len = state.panes.len();
+                            handle_server_msg(msg, &mut state, current_size);
+                            if state.pending_enter_new && state.panes.len() > old_len {
+                                state.pending_enter_new = false;
+                                state.selected = state.panes.len() - 1;
+                                mode = InputMode::Detail;
+                                let (cols, rows) = current_size;
+                                let pc = cols.saturating_sub(2).max(1);
+                                let pr = rows.saturating_sub(3).max(1);
+                                if let Some(id) = state.selected_pane_id() {
+                                    let _ = state.cmd_tx.send(ClientMsg::ResizePane { pane_id: id, cols: pc, rows: pr });
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -499,7 +518,7 @@ fn render_dashboard_status(area: Rect, buf: &mut ratatui::buffer::Buffer) {
     }
     Line::from(vec![
         Span::styled(" DASHBOARD ", Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled("  ↑↓←→/hjkl: navigate  1-9: open  Enter: open  n: new  N: custom  x: close  r: rename  q: quit", bg),
+        Span::styled("  ↑↓←→: navigate  1-9/Enter: open  n: new(enter)  N: pick agent/custom  x: close  r: rename  q: quit", bg),
     ]).render(area, buf);
 }
 

@@ -52,7 +52,6 @@ pub enum Action {
     SelectPane(usize),
 
     // Start-params form
-    OpenStartParams,
     StartParamsConfirm { cmd: String, args: String, cwd: String, title: String },
     StartParamsCancel,
 
