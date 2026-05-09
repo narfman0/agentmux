@@ -13,8 +13,6 @@ pub struct DashboardItem<'a> {
     pub snapshot: &'a ScreenSnapshot,
     pub title: &'a str,
     pub selected: bool,
-    /// True if broadcast mode is active.
-    pub broadcast: bool,
 }
 
 pub struct Dashboard<'a> {
@@ -67,11 +65,7 @@ impl<'a> Widget for Dashboard<'a> {
             let Some(&cell) = cells.get(i) else { break };
 
             let border_style = if item.selected {
-                if item.broadcast {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                }
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
@@ -79,7 +73,7 @@ impl<'a> Widget for Dashboard<'a> {
             let title_style = if item.selected {
                 Style::default()
                     .fg(Color::Black)
-                    .bg(if item.broadcast { Color::Yellow } else { Color::Cyan })
+                    .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)

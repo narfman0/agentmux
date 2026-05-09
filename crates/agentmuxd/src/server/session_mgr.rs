@@ -155,12 +155,6 @@ impl ServerSession {
         }
     }
 
-    pub fn broadcast_input(&mut self, data: &[u8]) {
-        for pane in self.panes.values_mut() {
-            let _ = pane.writer.write_all(data);
-        }
-    }
-
     pub fn subscribe_pane(&self, pane_id: PaneId, tx: ClientTx) -> Option<ScreenSnapshot> {
         let pane = self.panes.get(&pane_id)?;
         pane.shared.subscribe(tx);

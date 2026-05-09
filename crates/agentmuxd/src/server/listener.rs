@@ -15,17 +15,23 @@ use crate::layout_ops::SplitDir;
 use crate::server::session_mgr::{ServerSession, ServerState};
 
 pub async fn run_server(shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
+    agentmux_core::config::ensure_example_config();
     let cfg = agentmux_core::config::load_config();
     let state = Arc::new(Mutex::new(ServerState::new()));
 
     // Pre-create default session with the first configured agent (or "claude").
     {
         let mut s = state.lock().unwrap();
-        let (cmd, args, cwd) = cfg
+        let (cmd, mut args, cwd) = cfg
             .agent
             .first()
             .map(|a| (a.command.clone(), a.args.clone(), a.cwd.clone()))
             .unwrap_or_else(|| ("claude".to_string(), vec![], None));
+        if cfg.dangerously_skip_permissions
+            && !args.iter().any(|a| a == "--dangerously-skip-permissions")
+        {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         match ServerSession::new("default", &cmd, &args_refs, 220, 50, cwd.as_deref()) {
             Ok(sess) => { s.sessions.insert("default".to_string(), sess); }
@@ -126,9 +132,6 @@ async fn dispatch(
     match msg {
         ClientMsg::PaneInput { pane_id, data } => {
             let _ = sess.write_pane(pane_id, &data);
-        }
-        ClientMsg::BroadcastInput { data, .. } => {
-            sess.broadcast_input(&data);
         }
         ClientMsg::ResizePane { pane_id, cols, rows } => {
             sess.resize_pane(pane_id, cols, rows);

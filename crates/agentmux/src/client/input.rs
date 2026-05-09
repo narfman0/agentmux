@@ -24,9 +24,9 @@ pub enum Action {
     DashboardLeft,
     DashboardRight,
     DashboardSelect,   // Enter → Detail mode
-    AddPane,           // n → open agent picker
+    AddPane,           // N → open agent/custom picker modal
+    AddPaneDirect,     // n → spawn default agent and enter immediately
     RemovePane,        // x → close selected pane
-    ToggleBroadcast,   // b
 
     // Agent picker
     PickerUp,
@@ -97,10 +97,9 @@ pub fn handle_key(mode: &mut InputMode, ev: KeyEvent) -> Option<Action> {
                 KeyCode::Left  => Some(Action::DashboardLeft),
                 KeyCode::Right => Some(Action::DashboardRight),
                 KeyCode::Enter                       => Some(Action::DashboardSelect),
-                KeyCode::Char('n')                   => Some(Action::AddPane),
-                KeyCode::Char('N')                   => Some(Action::OpenStartParams),
+                KeyCode::Char('n')                   => Some(Action::AddPaneDirect),
+                KeyCode::Char('N')                   => Some(Action::AddPane),
                 KeyCode::Char('x')                   => Some(Action::RemovePane),
-                KeyCode::Char('b')                   => Some(Action::ToggleBroadcast),
                 KeyCode::Char('r')                   => Some(Action::StartRename),
                 KeyCode::Char('q') | KeyCode::Esc   => Some(Action::Quit),
                 KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
