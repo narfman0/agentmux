@@ -9,15 +9,18 @@ use ratatui::{
 pub struct AgentPicker<'a> {
     pub agents: &'a [String],
     pub selected: usize,
+    pub show_custom: bool,
 }
 
 impl<'a> AgentPicker<'a> {
     /// Render a centered popup over the terminal.
     pub fn render_popup(&self, area: Rect, buf: &mut Buffer) {
-        let popup = centered_rect(40, (self.agents.len() as u16 + 4).min(20), area);
+        let total_rows = self.agents.len() + if self.show_custom { 1 } else { 0 };
+        let popup = centered_rect(44, (total_rows as u16 + 4).min(22), area);
         Clear.render(popup, buf);
 
-        let items: Vec<ListItem> = self
+        let custom_idx = self.agents.len();
+        let mut items: Vec<ListItem> = self
             .agents
             .iter()
             .enumerate()
@@ -31,6 +34,15 @@ impl<'a> AgentPicker<'a> {
             })
             .collect();
 
+        if self.show_custom {
+            let style = if self.selected == custom_idx {
+                Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            items.push(ListItem::new(Line::from(Span::styled("  Custom command...  ", style))));
+        }
+
         let mut state = ListState::default();
         state.select(Some(self.selected));
 
@@ -40,7 +52,7 @@ impl<'a> AgentPicker<'a> {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
                     .title(Span::styled(
-                        " New Pane — select agent (↑↓ Enter) ",
+                        " New Pane — pick agent or custom (↑↓ Enter) ",
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     )),
             )

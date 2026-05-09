@@ -98,7 +98,6 @@ fn default_binds() -> Vec<KeybindDef> {
         KeybindDef { key: "n".into(), action: "new_pane".into() },
         KeybindDef { key: "x".into(), action: "close_pane".into() },
         KeybindDef { key: "d".into(), action: "detach".into() },
-        KeybindDef { key: "b".into(), action: "toggle_broadcast".into() },
         KeybindDef { key: ":".into(), action: "command_prompt".into() },
         KeybindDef { key: "1".into(), action: "focus_pane_1".into() },
         KeybindDef { key: "2".into(), action: "focus_pane_2".into() },

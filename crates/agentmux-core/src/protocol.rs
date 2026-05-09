@@ -29,7 +29,6 @@ pub enum ClientMsg {
     ResizePane { pane_id: PaneId, cols: u16, rows: u16 },
     FocusPane { pane_id: PaneId },
     PaneInput { pane_id: PaneId, data: Vec<u8> },
-    BroadcastInput { session_id: SessionId, data: Vec<u8> },
     SubscribePaneOutput { pane_id: PaneId },
     UnsubscribePaneOutput { pane_id: PaneId },
     /// Spawn a new pane with an arbitrary command (server picks split target).

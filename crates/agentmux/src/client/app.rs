@@ -54,9 +54,9 @@ impl RemotePane {
 pub struct AppState {
     pub panes: Vec<RemotePane>,
     pub selected: usize,
-    pub broadcast: bool,
     pub title: String,
     pub cmd_tx: UnboundedSender<ClientMsg>,
+    pub pending_enter_new: bool,
 }
 
 impl AppState {
@@ -167,9 +167,9 @@ pub async fn run(session_name: &str) -> Result<()> {
     let mut state = AppState {
         panes: Vec::new(),
         selected: 0,
-        broadcast: false,
         title: session_name.to_string(),
         cmd_tx,
+        pending_enter_new: false,
     };
 
     let mut current_size = crossterm::terminal::size().unwrap_or((220, 50));
@@ -190,7 +190,6 @@ pub async fn run(session_name: &str) -> Result<()> {
             tokio::select! {
                 _ = tick.tick() => {
                     let sel = state.selected;
-                    let broadcast = state.broadcast;
                     let grid_cols = Dashboard::grid_cols(state.panes.len());
 
                     terminal.draw(|f| {
@@ -225,14 +224,13 @@ pub async fn run(session_name: &str) -> Result<()> {
                                         snapshot: &pane.snapshot,
                                         title: &labels[i],
                                         selected: i == sel,
-                                        broadcast,
                                     })
                                     .collect();
 
                                 Dashboard { items, cols: grid_cols }.render(grid_area, f.buffer_mut());
 
                                 if let InputMode::AgentPicker { selected: ps, .. } = &mode {
-                                    AgentPicker { agents: &agent_names, selected: *ps }
+                                    AgentPicker { agents: &agent_names, selected: *ps, show_custom: true }
                                         .render_popup(grid_area, f.buffer_mut());
                                 }
                                 if let InputMode::StartParams { cmd, args, cwd, title, focused } = &mode {
@@ -240,7 +238,7 @@ pub async fn run(session_name: &str) -> Result<()> {
                                         .render_popup(grid_area, f.buffer_mut());
                                 }
 
-                                render_dashboard_status(status_area, f.buffer_mut(), broadcast);
+                                render_dashboard_status(status_area, f.buffer_mut());
                             }
 
                             InputMode::Detail => {
@@ -260,8 +258,7 @@ pub async fn run(session_name: &str) -> Result<()> {
                                     }
                                 }
                                 render_detail_status(status_area, f.buffer_mut(),
-                                    state.panes.get(sel).map(|p| p.label()).as_deref().unwrap_or(""),
-                                    broadcast);
+                                    state.panes.get(sel).map(|p| p.label()).as_deref().unwrap_or(""));
                             }
 
                             InputMode::Rename { buf } | InputMode::RenameTitle { buf } => {
@@ -280,7 +277,7 @@ pub async fn run(session_name: &str) -> Result<()> {
                                     .enumerate()
                                     .map(|(i, pane)| DashboardItem {
                                         snapshot: &pane.snapshot, title: &labels[i],
-                                        selected: i == sel, broadcast,
+                                        selected: i == sel,
                                     })
                                     .collect();
                                 Dashboard { items, cols: grid_cols }.render(dash_chunks[1], f.buffer_mut());
@@ -335,15 +332,33 @@ pub async fn run(session_name: &str) -> Result<()> {
                                         }
 
                                         Action::AddPane => {
-                                            mode = InputMode::AgentPicker { selected: 0, count: agent_names.len().max(1) };
+                                            // +1 for the "Custom command..." entry at the bottom
+                                            mode = InputMode::AgentPicker { selected: 0, count: agent_names.len() + 1 };
+                                        }
+
+                                        Action::AddPaneDirect => {
+                                            let cmd  = agent_commands.first().cloned().unwrap_or_default();
+                                            let args = agent_args.first().cloned().unwrap_or_default();
+                                            let cwd  = agent_cwds.first().cloned().unwrap_or(None);
+                                            let _ = state.cmd_tx.send(ClientMsg::SpawnPane { cmd, args, cwd });
+                                            state.pending_enter_new = true;
                                         }
 
                                         Action::PickerConfirm(idx) => {
-                                            let cmd  = agent_commands.get(idx).cloned().unwrap_or_default();
-                                            let args = agent_args.get(idx).cloned().unwrap_or_default();
-                                            let cwd  = agent_cwds.get(idx).cloned().unwrap_or(None);
-                                            let _ = state.cmd_tx.send(ClientMsg::SpawnPane { cmd, args, cwd });
-                                            mode = InputMode::Dashboard;
+                                            if idx == agent_names.len() {
+                                                // "Custom command..." selected — open the params form
+                                                mode = InputMode::StartParams {
+                                                    cmd: String::new(), args: String::new(),
+                                                    cwd: String::new(), title: String::new(), focused: 0,
+                                                };
+                                            } else {
+                                                let cmd  = agent_commands.get(idx).cloned().unwrap_or_default();
+                                                let args = agent_args.get(idx).cloned().unwrap_or_default();
+                                                let cwd  = agent_cwds.get(idx).cloned().unwrap_or(None);
+                                                let _ = state.cmd_tx.send(ClientMsg::SpawnPane { cmd, args, cwd });
+                                                state.pending_enter_new = true;
+                                                mode = InputMode::Dashboard;
+                                            }
                                         }
 
                                         Action::PickerCancel | Action::PickerUp | Action::PickerDown => {}
@@ -371,19 +386,13 @@ pub async fn run(session_name: &str) -> Result<()> {
 
                                         Action::CancelRenameTitle => {}
 
-                                        Action::OpenStartParams => {
-                                            mode = InputMode::StartParams {
-                                                cmd: String::new(), args: String::new(),
-                                                cwd: String::new(), title: String::new(), focused: 0,
-                                            };
-                                        }
-
                                         Action::StartParamsConfirm { cmd, args: args_str, cwd, title } => {
                                             if !cmd.is_empty() {
                                                 let args = args_str.split_whitespace().map(String::from).collect();
                                                 let cwd_opt = if cwd.is_empty() { None } else { Some(cwd) };
                                                 let _ = state.cmd_tx.send(ClientMsg::SpawnPane { cmd, args, cwd: cwd_opt });
                                                 if !title.is_empty() { state.title = title; }
+                                                state.pending_enter_new = true;
                                                 mode = InputMode::Dashboard;
                                             }
                                         }
@@ -409,18 +418,8 @@ pub async fn run(session_name: &str) -> Result<()> {
                                             }
                                         }
 
-                                        Action::ToggleBroadcast => {
-                                            state.broadcast = !state.broadcast;
-                                        }
-
                                         Action::PaneInput(bytes) => {
-                                            if state.broadcast {
-                                                for p in &state.panes {
-                                                    let _ = state.cmd_tx.send(ClientMsg::PaneInput {
-                                                        pane_id: p.pane_id, data: bytes.clone(),
-                                                    });
-                                                }
-                                            } else if let Some(id) = state.selected_pane_id() {
+                                            if let Some(id) = state.selected_pane_id() {
                                                 let _ = state.cmd_tx.send(ClientMsg::PaneInput { pane_id: id, data: bytes });
                                             }
                                         }
@@ -451,7 +450,21 @@ pub async fn run(session_name: &str) -> Result<()> {
                 maybe_ipc = event_rx.recv() => {
                     match maybe_ipc {
                         None => break,
-                        Some(msg) => handle_server_msg(msg, &mut state, current_size),
+                        Some(msg) => {
+                            let old_len = state.panes.len();
+                            handle_server_msg(msg, &mut state, current_size);
+                            if state.pending_enter_new && state.panes.len() > old_len {
+                                state.pending_enter_new = false;
+                                state.selected = state.panes.len() - 1;
+                                mode = InputMode::Detail;
+                                let (cols, rows) = current_size;
+                                let pc = cols.saturating_sub(2).max(1);
+                                let pr = rows.saturating_sub(3).max(1);
+                                if let Some(id) = state.selected_pane_id() {
+                                    let _ = state.cmd_tx.send(ClientMsg::ResizePane { pane_id: id, cols: pc, rows: pr });
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -499,21 +512,15 @@ fn render_session_title(area: Rect, buf: &mut ratatui::buffer::Buffer, title: &s
         .render(area, buf);
 }
 
-fn render_dashboard_status(area: Rect, buf: &mut ratatui::buffer::Buffer, broadcast: bool) {
+fn render_dashboard_status(area: Rect, buf: &mut ratatui::buffer::Buffer) {
     let bg = Style::default().bg(Color::DarkGray).fg(Color::White);
     for x in area.x..area.x + area.width {
         if let Some(c) = buf.cell_mut((x, area.y)) { c.set_char(' '); c.set_style(bg); }
     }
-    let mut spans = vec![
+    Line::from(vec![
         Span::styled(" DASHBOARD ", Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled("  ↑↓←→/hjkl: navigate  1-9: open  Enter: open  n: new  N: custom  x: close  r: rename", bg),
-    ];
-    if broadcast {
-        spans.push(Span::styled("  [BROADCAST] ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)));
-    } else {
-        spans.push(Span::styled("  b: broadcast  q: quit", bg));
-    }
-    Line::from(spans).render(area, buf);
+        Span::styled("  ↑↓←→: navigate  1-9/Enter: open  n: new(enter)  N: pick agent/custom  x: close  r: rename  q: quit", bg),
+    ]).render(area, buf);
 }
 
 fn render_rename_title_status(area: Rect, buf: &mut ratatui::buffer::Buffer) {
@@ -540,17 +547,13 @@ fn render_rename_status(area: Rect, buf: &mut ratatui::buffer::Buffer, input: &s
     ]).render(area, buf);
 }
 
-fn render_detail_status(area: Rect, buf: &mut ratatui::buffer::Buffer, agent: &str, broadcast: bool) {
+fn render_detail_status(area: Rect, buf: &mut ratatui::buffer::Buffer, agent: &str) {
     let bg = Style::default().bg(Color::DarkGray).fg(Color::White);
     for x in area.x..area.x + area.width {
         if let Some(c) = buf.cell_mut((x, area.y)) { c.set_char(' '); c.set_style(bg); }
     }
-    let mut spans = vec![
+    Line::from(vec![
         Span::styled(format!(" {} ", agent), Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)),
         Span::styled("  Esc/Ctrl+\\: back to dashboard", bg),
-    ];
-    if broadcast {
-        spans.push(Span::styled("  [BROADCAST] ", Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)));
-    }
-    Line::from(spans).render(area, buf);
+    ]).render(area, buf);
 }
