@@ -88,10 +88,11 @@ fn sync_panes_from_session(state: &mut AppState, session: &Session, current_size
 
     for p in &all_panes {
         if !state.panes.iter().any(|rp| rp.pane_id == p.id) {
-            let _ = state.cmd_tx.send(ClientMsg::SubscribePaneOutput { pane_id: p.id });
             let gc = Dashboard::grid_cols(state.panes.len() + 1);
             let (cols, rows) = thumb_size(current_size, state.panes.len() + 1, gc);
+            // Resize first so Claude redraws at the correct size before we receive any snapshots.
             let _ = state.cmd_tx.send(ClientMsg::ResizePane { pane_id: p.id, cols, rows });
+            let _ = state.cmd_tx.send(ClientMsg::SubscribePaneOutput { pane_id: p.id });
             state.panes.push(RemotePane {
                 pane_id: p.id,
                 agent_name: p.agent_name.clone(),

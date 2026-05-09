@@ -76,18 +76,11 @@ async fn handle_client(
 
     let mut framed = Framed::new(pipe, MsgCodec::<ClientMsg>::new());
 
-    // Send current session state on connect.
+    // Send current session state on connect; client will subscribe panes explicitly after resize.
     {
         let s = state.lock().unwrap();
         if let Some(sess) = s.sessions.get(&session_name) {
             let _ = push_tx.try_send(ServerMsg::Attached { session: sess.session_meta() });
-            for pane_id in sess.panes.keys().copied().collect::<Vec<_>>() {
-                if let Some(snap) = sess.subscribe_pane(pane_id, push_tx.clone()) {
-                    let _ = push_tx.try_send(ServerMsg::PaneOutput(
-                        PaneOutput { pane_id, snapshot: snap },
-                    ));
-                }
-            }
         }
     }
 
